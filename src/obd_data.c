@@ -14,8 +14,7 @@ static const char *TAG = "OBD_DATA";
 vehicle_data_t vehicle_data = {
     .rpm = 0,
     .throttle_position = 0,
-    .vehicle_speed = 0,
-    .current_gear = "N/A"
+    .vehicle_speed = 0
 };
 
 // Initialize OBD data system
@@ -24,7 +23,6 @@ void obd_data_init(void) {
     vehicle_data.rpm = 0;
     vehicle_data.throttle_position = 0;
     vehicle_data.vehicle_speed = 0;
-    strcpy(vehicle_data.current_gear, "N/A");
     
     LOG_VERBOSE(TAG, "OBD data system initialized");
 }
@@ -65,45 +63,23 @@ uint8_t parse_speed(const char *response) {
     return 0;
 }
 
-// Parse gear position (simplified estimation based on RPM and speed)
-void parse_gear(const char *response) {
-    // This is a simplified gear estimation
-    // Real gear detection would require more sophisticated OBD-II commands
-    
-    if (vehicle_data.vehicle_speed == 0) {
-        strcpy(vehicle_data.current_gear, "N");  // Neutral/Park
-    } else if (vehicle_data.vehicle_speed > 0 && vehicle_data.vehicle_speed < 20) {
-        strcpy(vehicle_data.current_gear, "1");  // First gear
-    } else if (vehicle_data.vehicle_speed >= 20 && vehicle_data.vehicle_speed < 40) {
-        strcpy(vehicle_data.current_gear, "2");  // Second gear
-    } else if (vehicle_data.vehicle_speed >= 40 && vehicle_data.vehicle_speed < 60) {
-        strcpy(vehicle_data.current_gear, "3");  // Third gear
-    } else if (vehicle_data.vehicle_speed >= 60 && vehicle_data.vehicle_speed < 80) {
-        strcpy(vehicle_data.current_gear, "4");  // Fourth gear
-    } else if (vehicle_data.vehicle_speed >= 80) {
-        strcpy(vehicle_data.current_gear, "5+"); // Fifth+ gear
-    } else {
-        strcpy(vehicle_data.current_gear, "N/A");
-    }
-}
+
 
 // Display current vehicle data
 void display_vehicle_data(void) {
-    ESP_LOGI(TAG, "Vehicle Data: RPM=%lu | Throttle=%d%% | Speed=%d km/h | Gear=%s", 
-             vehicle_data.rpm, 
-             vehicle_data.throttle_position, 
-             vehicle_data.vehicle_speed, 
-             vehicle_data.current_gear);
+    ESP_LOGI(TAG, "Vehicle Data: RPM=%lu | Throttle=%d%% | Speed=%d km/h", 
+             vehicle_data.rpm,
+             vehicle_data.throttle_position,
+             vehicle_data.vehicle_speed);
 }
 
 // Log vehicle status with GPIO state
 void log_vehicle_status(void) {
     const char* gpio_state = gpio_status ? "ON" : "OFF";
-    ESP_LOGI(TAG, "RPM: %lu | Throttle: %d%% | Speed: %d km/h | Gear: %s | GPIO2: %s",
+    ESP_LOGI(TAG, "RPM: %lu | Throttle: %d%% | Speed: %d km/h | GPIO2: %s",
              vehicle_data.rpm,
              vehicle_data.throttle_position,
              vehicle_data.vehicle_speed,
-             vehicle_data.current_gear,
              gpio_state);
 }
 
@@ -135,8 +111,7 @@ void obd_task(void *pv) {
             send_obd_command("010D");  // Vehicle speed
             vTaskDelay(pdMS_TO_TICKS(50));
             
-            // Update gear estimation based on current data
-            parse_gear(NULL);  // Use current vehicle data for estimation
+
             
             // Log current status every ~500ms (close to user's request)
             static int log_counter = 0;

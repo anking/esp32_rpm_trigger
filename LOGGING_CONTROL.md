@@ -40,17 +40,18 @@ SCN 2 connection initiated
 RFCOMM connection established
 Basic ELM327 initialization complete!
 Starting OBD data polling...
-[Vehicle data logged every 400ms (close to requested 500ms)]
+[Vehicle data: RPM, Throttle, Speed logged every 400ms (close to requested 500ms)]
 [NO MORE BT_RFCOMM/BT_L2CAP spam!]
 ```
 
 ## ⚡ Performance Benefits
 
 - **Faster execution** - Less time spent on logging
-- **Cleaner output** - Only essential information shown
+- **Cleaner output** - Only essential information shown (RPM, Throttle, Speed)
 - **Reduced flash usage** - Conditional compilation removes unused strings
 - **Better debugging** - Enable only what you need
 - **Configurable frequency** - Vehicle data logged every ~400ms (close to 500ms)
+- **Accurate data only** - Removed unreliable gear estimation logic
 
 ## 🎯 Recommended Settings
 

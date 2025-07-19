@@ -8,7 +8,6 @@ typedef struct {
     uint32_t rpm;
     uint8_t throttle_position;  // 0-100%
     uint8_t vehicle_speed;      // km/h
-    char current_gear[4];       // "N/A", "1", "2", etc.
 } vehicle_data_t;
 
 // Global vehicle data
@@ -22,7 +21,6 @@ void obd_task(void *pv);
 uint32_t parse_rpm(const char *response);
 uint8_t parse_throttle(const char *response);
 uint8_t parse_speed(const char *response);
-void parse_gear(const char *response);
 
 // Data display
 void display_vehicle_data(void);
