@@ -19,6 +19,7 @@ static const char *TAG = "ELM327";
 // ELM327 state variables
 bool elm327_initialized = false;
 bool ecu_connected = false;
+bool response_received_flag = false;  // Flag set when any response is received
 SemaphoreHandle_t connection_semaphore;
 char rx_buffer[RX_BUFFER_SIZE];
 uint16_t rx_buffer_len = 0;
@@ -34,6 +35,7 @@ static volatile bool initialization_in_progress = false;
 static uint8_t consecutive_ecu_failures = 0;
 static uint8_t unable_to_connect_count = 0;
 static uint8_t can_error_count = 0;
+static volatile bool ecu_test_response_received = false;
 #define MAX_CONSECUTIVE_FAILURES 3
 #define MAX_UNABLE_TO_CONNECT 2
 #define MAX_CAN_ERRORS 5
@@ -114,8 +116,10 @@ void elm327_handle_response(const char *response) {
     // Check for common ELM327 responses
     if (strstr(response, "ELM327")) {
         ESP_LOGI(TAG, "🔧 ELM327 device identified: %s", response);
+        response_received_flag = true;  // Signal response received
     } else if (strstr(response, "OK")) {
         ESP_LOGD(TAG, "✅ Command acknowledged");
+        response_received_flag = true;  // Signal response received
     } else if (strstr(response, "CAN ERROR") || strstr(response, "NO DATA")) {
         ESP_LOGW(TAG, "⚠️ CAN/ECU error: %s", response);
         
@@ -132,11 +136,13 @@ void elm327_handle_response(const char *response) {
         
         // Check for ECU disconnection
         check_ecu_disconnection();
+        response_received_flag = true;  // Signal error response received
         return;
     } else if (strstr(response, "ERROR")) {
         ESP_LOGW(TAG, "⚠️ ELM327 error: %s", response);
         consecutive_ecu_failures++;
         check_ecu_disconnection();
+        response_received_flag = true;  // Signal error response received
     } else if (strstr(response, "UNABLE TO CONNECT")) {
         ESP_LOGD(TAG, "🔌 ELM327 cannot connect to ECU");
         
@@ -146,14 +152,25 @@ void elm327_handle_response(const char *response) {
         
         // Check for ECU disconnection
         check_ecu_disconnection();
+        response_received_flag = true;  // Signal error response received
     } else if (strstr(response, "SEARCHING")) {
         ESP_LOGD(TAG, "🔍 ELM327 searching for ECU...");
+        response_received_flag = true;  // Signal response received
     } else {
         // Successfully received some response - reset basic failure counter
         consecutive_fail = 0;
         
+        // Check if this is a valid ECU test response (Mode 1, PID 00)
+        if (strstr(response, "41 00") != NULL) {
+            ecu_test_response_received = true;
+            ESP_LOGD(TAG, "🎯 ECU test response detected: %s", response);
+        }
+        
         // Process as potential OBD data
         process_obd_response(response);
+        
+        // Signal response received AFTER data processing is complete
+        response_received_flag = true;
     }
 }
 
@@ -229,6 +246,7 @@ bool test_ecu_connectivity(void) {
     
     // Clear any pending response flags and buffer
     elm_ready = false;
+    ecu_test_response_received = false;  // Clear ECU test flag
     memset(rx_buffer, 0, RX_BUFFER_SIZE);
     rx_buffer_len = 0;
     
@@ -246,13 +264,14 @@ bool test_ecu_connectivity(void) {
     while ((xTaskGetTickCount() - start_time) < timeout) {
         vTaskDelay(pdMS_TO_TICKS(50));  // Check every 50ms
         
-        // Check if we got a valid OBD response (starts with "41 00")
+        // Check if we got a valid ECU test response (flag set by elm327_handle_response)
+        if (ecu_test_response_received) {
+            ESP_LOGI(TAG, "✅ ECU connection verified! Supported PIDs detected");
+            return true;
+        }
+        
+        // Check for error responses in buffer
         if (rx_buffer_len > 5) {
-            if (strstr(rx_buffer, "41 00") != NULL) {
-                ESP_LOGI(TAG, "✅ ECU connection verified! Supported PIDs detected");
-                return true;
-            }
-            
             // Check for error responses
             if (strstr(rx_buffer, "UNABLE TO CONNECT") != NULL) {
                 return false;
@@ -332,6 +351,13 @@ void check_ecu_disconnection(void) {
     if (!ecu_connected) {
         return;  // Already disconnected
     }
+    
+    // NOTE: ECU disconnection is now handled by the adaptive polling system
+    // in obd_data.c which only triggers after multiple consecutive errors
+    // at maximum delay (500ms). This provides more intelligent ECU health monitoring.
+    
+    // Legacy disconnection logic disabled - adaptive polling handles this better
+    return;
     
     // Check if we've exceeded disconnection thresholds
     if (consecutive_ecu_failures >= MAX_CONSECUTIVE_FAILURES || 

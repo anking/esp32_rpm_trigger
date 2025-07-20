@@ -2,6 +2,9 @@
 #define OBD_DATA_H
 
 #include <stdint.h>
+#include "freertos/FreeRTOS.h"
+#include "esp_err.h"
+#include <stdbool.h>
 
 // Vehicle data structure
 typedef struct {
@@ -23,5 +26,7 @@ void parse_multi_pid_line(char *line);
 // Data display
 void display_vehicle_data(void);
 void log_vehicle_status(void);
+
+int send_obd_command_adaptive(const char *cmd, uint16_t *current_delay_ms, uint8_t *errors_at_max_delay);
 
 #endif // OBD_DATA_H 

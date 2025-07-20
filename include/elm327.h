@@ -8,6 +8,7 @@
 // ELM327 state
 extern bool elm327_initialized;
 extern bool ecu_connected;
+extern bool response_received_flag;  // Flag set when any response is received
 extern SemaphoreHandle_t connection_semaphore;
 
 // RX Buffer for ELM327 responses
