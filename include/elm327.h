@@ -7,6 +7,7 @@
 
 // ELM327 state
 extern bool elm327_initialized;
+extern bool ecu_connected;
 extern SemaphoreHandle_t connection_semaphore;
 
 // RX Buffer for ELM327 responses
@@ -21,8 +22,17 @@ void initialize_elm327(void);
 void initialize_elm327_task(void *pv);
 void process_received_data(const char *data, uint16_t len);
 
+// ECU connectivity verification
+bool test_ecu_connectivity(void);
+void verify_ecu_connection(void);
+void check_ecu_disconnection(void);
+void reset_ecu_connection(void);
+void ecu_reconnection_task(void *pv);
+void reset_ecu_error_counters(void);
+
 // ELM327 communication
 esp_err_t elm327_send_command(const char *cmd);
 void elm327_handle_response(const char *response);
+void process_obd_response(const char *response);
 
 #endif // ELM327_H 

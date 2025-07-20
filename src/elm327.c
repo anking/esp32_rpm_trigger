@@ -10,8 +10,15 @@
 
 static const char *TAG = "ELM327";
 
+/*
+ * ELM327 Communication Logging:
+ * ⬆️ SEND: Commands sent TO ELM327
+ * ⬇️ RECV: Responses received FROM ELM327  
+ */
+
 // ELM327 state variables
 bool elm327_initialized = false;
+bool ecu_connected = false;
 SemaphoreHandle_t connection_semaphore;
 char rx_buffer[RX_BUFFER_SIZE];
 uint16_t rx_buffer_len = 0;
@@ -19,6 +26,17 @@ uint16_t rx_buffer_len = 0;
 // Command pacing - wait for prompt before sending next command
 static volatile bool elm_ready = false;
 static uint8_t consecutive_fail = 0;
+
+// Initialization phase tracking
+static volatile bool initialization_in_progress = false;
+
+// ECU disconnection detection
+static uint8_t consecutive_ecu_failures = 0;
+static uint8_t unable_to_connect_count = 0;
+static uint8_t can_error_count = 0;
+#define MAX_CONSECUTIVE_FAILURES 3
+#define MAX_UNABLE_TO_CONNECT 2
+#define MAX_CAN_ERRORS 5
 
 // Initialize ELM327 system (semaphore, etc.)
 void elm327_init_system(void) {
@@ -36,9 +54,14 @@ void elm327_init_system(void) {
     LOG_VERBOSE(TAG, "ELM327 system initialized");
 }
 
-// Send OBD command to ELM327
+// Send OBD command to ELM327 (DEPRECATED - use elm327_send_command instead)
 void send_obd_command(const char *cmd) {
+    ESP_LOGW(TAG, "⚠️ DEPRECATED: send_obd_command() - use elm327_send_command() instead");
+    
     if (is_connected && elm327_initialized && spp_handle) {
+        // Always log outgoing commands
+        ESP_LOGI(TAG, "⬆️ SEND: %s", cmd);
+        
         // Format command with carriage return
         char formatted_cmd[32];
         snprintf(formatted_cmd, sizeof(formatted_cmd), "%s\r", cmd);
@@ -48,7 +71,7 @@ void send_obd_command(const char *cmd) {
             ESP_LOGW(TAG, "⚠️ Failed to send command: %s", esp_err_to_name(ret));
         }
     } else {
-        ESP_LOGW(TAG, "⚠️ Cannot send command - not connected or not initialized");
+        ESP_LOGW(TAG, "⚠️ Cannot send command '%s' - not connected or not initialized", cmd);
     }
 }
 
@@ -59,6 +82,9 @@ esp_err_t elm327_send_command(const char *cmd) {
         return ESP_ERR_INVALID_STATE;
     }
     
+    // Always log outgoing commands
+    ESP_LOGI(TAG, "⬆️ SEND: %s", cmd);
+    
     // Wait for ELM327 to be ready (prompt detected) with timeout
     TickType_t start_time = xTaskGetTickCount();
     TickType_t timeout = pdMS_TO_TICKS(2000);  // 2 second timeout
@@ -68,7 +94,11 @@ esp_err_t elm327_send_command(const char *cmd) {
         
         // Check for timeout to prevent watchdog issues
         if ((xTaskGetTickCount() - start_time) > timeout) {
-            ESP_LOGW(TAG, "⚠️ Timeout waiting for ELM327 prompt, sending anyway");
+            if (initialization_in_progress) {
+                ESP_LOGD(TAG, "🔧 ELM327 busy during initialization, sending anyway");
+            } else {
+                ESP_LOGW(TAG, "⚠️ Timeout waiting for ELM327 prompt, sending anyway");
+            }
             break;
         }
     }
@@ -78,9 +108,7 @@ esp_err_t elm327_send_command(const char *cmd) {
     int len = snprintf(formatted_cmd, sizeof(formatted_cmd), "%s\r", cmd);
     
     esp_err_t ret = esp_spp_write(spp_handle, len, (uint8_t *)formatted_cmd);
-    if (ret == ESP_OK) {
-        ESP_LOGD(TAG, "📤 Sent: %s", cmd);
-    } else {
+    if (ret != ESP_OK) {
         ESP_LOGW(TAG, "⚠️ Failed to send '%s': %s", cmd, esp_err_to_name(ret));
     }
     
@@ -93,7 +121,7 @@ void elm327_handle_response(const char *response) {
         return;
     }
     
-    ESP_LOGI(TAG, "📥 ELM327 RAW response: '%s'", response);
+    ESP_LOGI(TAG, "⬇️ RECV: '%s'", response);
     
     // Check for common ELM327 responses
     if (strstr(response, "ELM327")) {
@@ -102,29 +130,55 @@ void elm327_handle_response(const char *response) {
         ESP_LOGD(TAG, "✅ Command acknowledged");
     } else if (strstr(response, "CAN ERROR") || strstr(response, "NO DATA")) {
         ESP_LOGW(TAG, "⚠️ CAN/ECU error: %s", response);
+        
+        // Track ECU disconnection patterns
+        consecutive_ecu_failures++;
+        can_error_count++;
+        
         if (++consecutive_fail >= 3) {
             ESP_LOGW(TAG, "⚠️ 3 consecutive failures, backing off...");
             consecutive_fail = 0;
             // Slow-down: pause for 300ms
             vTaskDelay(pdMS_TO_TICKS(300));
         }
+        
+        // Check for ECU disconnection
+        check_ecu_disconnection();
         return;
     } else if (strstr(response, "ERROR")) {
         ESP_LOGW(TAG, "⚠️ ELM327 error: %s", response);
+        consecutive_ecu_failures++;
+        check_ecu_disconnection();
     } else if (strstr(response, "UNABLE TO CONNECT")) {
-        ESP_LOGD(TAG, "🔌 ELM327 cannot connect to ECU (normal when not in car)");
+        ESP_LOGD(TAG, "🔌 ELM327 cannot connect to ECU");
+        
+        // Track unable to connect failures
+        consecutive_ecu_failures++;
+        unable_to_connect_count++;
+        
+        // Check for ECU disconnection
+        check_ecu_disconnection();
     } else if (strstr(response, "SEARCHING")) {
         ESP_LOGD(TAG, "🔍 ELM327 searching for ECU...");
     } else {
-        // Successfully received data - reset failure counter
+        // Successfully received some response - reset basic failure counter
         consecutive_fail = 0;
         
         // Process as potential OBD data
-        /* Handle possible multi-PID payload */
+        process_obd_response(response);
+    }
+}
+
+// Process OBD data responses
+void process_obd_response(const char *response) {
+    // Only reset ECU error counters for actual OBD responses (start with "41")
+    if (strstr(response, "41 ") != NULL) {
+        // This is a valid OBD Mode 1 response - parse it
         char response_copy[256];
         strncpy(response_copy, response, sizeof(response_copy) - 1);
         response_copy[sizeof(response_copy) - 1] = '\0';
         parse_multi_pid_line(response_copy);
+        // Note: parse_multi_pid_line will call reset_ecu_error_counters() if successful
     }
 }
 
@@ -159,95 +213,256 @@ void process_received_data(const char *data, uint16_t len) {
     }
 }
 
+// Test ECU connectivity with a basic OBD command
+bool test_ecu_connectivity(void) {
+    if (!elm327_initialized) {
+        return false;
+    }
+    
+    ESP_LOGI(TAG, "🔍 Testing ECU connectivity...");
+    
+    // Clear any pending response flags and buffer
+    elm_ready = false;
+    memset(rx_buffer, 0, RX_BUFFER_SIZE);
+    rx_buffer_len = 0;
+    
+    // Send basic OBD test command (get supported PIDs)
+    esp_err_t ret = elm327_send_command("0100");
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "❌ Failed to send ECU test command");
+        return false;
+    }
+    
+    // Wait for response with timeout
+    TickType_t start_time = xTaskGetTickCount();
+    TickType_t timeout = pdMS_TO_TICKS(4000);  // 4 second timeout (longer for first connection)
+    
+    while ((xTaskGetTickCount() - start_time) < timeout) {
+        vTaskDelay(pdMS_TO_TICKS(50));  // Check every 50ms
+        
+        // Check if we got a valid OBD response (starts with "41 00")
+        if (rx_buffer_len > 5) {
+            if (strstr(rx_buffer, "41 00") != NULL) {
+                ESP_LOGI(TAG, "✅ ECU connection verified! Supported PIDs detected");
+                return true;
+            }
+            
+            // Check for error responses
+            if (strstr(rx_buffer, "UNABLE TO CONNECT") != NULL) {
+                return false;
+            }
+            
+            if (strstr(rx_buffer, "CAN ERROR") != NULL) {
+                return false;
+            }
+            
+            if (strstr(rx_buffer, "NO DATA") != NULL) {
+                return false;
+            }
+            
+            // If we got "SEARCHING..." continue waiting
+            if (strstr(rx_buffer, "SEARCHING") != NULL) {
+                // Clear buffer and continue waiting
+                memset(rx_buffer, 0, RX_BUFFER_SIZE);
+                rx_buffer_len = 0;
+                continue;
+            }
+        }
+    }
+    
+    ESP_LOGD(TAG, "❌ ECU test timeout - no valid response received");
+    return false;
+}
+
+// Verify ECU connection with retries
+void verify_ecu_connection(void) {
+    ESP_LOGI(TAG, "🔗 === ECU CONNECTION VERIFICATION START ===");
+    ESP_LOGI(TAG, "📡 Testing connection to vehicle ECU...");
+    
+    ecu_connected = false;
+    int attempt = 1;
+    
+    while (!ecu_connected) {
+        ESP_LOGI(TAG, "🔄 ECU Connection Attempt #%d", attempt);
+        
+        if (test_ecu_connectivity()) {
+            ecu_connected = true;
+            ESP_LOGI(TAG, "✅ === ECU CONNECTION ESTABLISHED ===");
+            ESP_LOGI(TAG, "🚗 Vehicle ECU is responding to OBD commands");
+            ESP_LOGI(TAG, "🎯 System ready for OBD data polling!");
+            break;
+        }
+        
+        ESP_LOGD(TAG, "⏱️ ECU not ready, retrying in 2 seconds...");
+        ESP_LOGD(TAG, "💡 Ensure: 1) Ignition ON  2) Engine running  3) OBD cable secure");
+        
+        vTaskDelay(pdMS_TO_TICKS(2000));  // Wait 2 seconds before retry
+        attempt++;
+        
+        // Optional: Add max attempts if desired
+        // if (attempt > 30) { // 1 minute of attempts
+        //     ESP_LOGE(TAG, "❌ ECU connection failed after 30 attempts");
+        //     break;
+        // }
+    }
+}
+
+// Check for ECU disconnection based on error patterns
+void check_ecu_disconnection(void) {
+    if (!ecu_connected) {
+        return;  // Already disconnected
+    }
+    
+    // Check if we've exceeded disconnection thresholds
+    if (consecutive_ecu_failures >= MAX_CONSECUTIVE_FAILURES || 
+        unable_to_connect_count >= MAX_UNABLE_TO_CONNECT ||
+        can_error_count >= MAX_CAN_ERRORS) {
+        
+        ESP_LOGW(TAG, "🔴 ECU DISCONNECTION DETECTED!");
+        ESP_LOGW(TAG, "├─ Consecutive failures: %d/%d", consecutive_ecu_failures, MAX_CONSECUTIVE_FAILURES);
+        ESP_LOGW(TAG, "├─ Unable to connect: %d/%d", unable_to_connect_count, MAX_UNABLE_TO_CONNECT);
+        ESP_LOGW(TAG, "├─ CAN errors: %d/%d", can_error_count, MAX_CAN_ERRORS);
+        
+        reset_ecu_connection();
+    }
+}
+
+// Reset ECU connection and start reconnection process
+void reset_ecu_connection(void) {
+    ESP_LOGW(TAG, "🔄 Resetting ECU connection - will attempt reconnection");
+    
+    // Reset connection state
+    ecu_connected = false;
+    
+    // Reset error counters
+    consecutive_ecu_failures = 0;
+    unable_to_connect_count = 0;
+    can_error_count = 0;
+    
+    ESP_LOGI(TAG, "🔗 Starting ECU reconnection process...");
+    
+    // Start verification in separate task to avoid blocking
+    xTaskCreate(ecu_reconnection_task, "ecu_reconnect", 4096, NULL, 5, NULL);
+}
+
+// ECU reconnection task (runs in separate thread)
+void ecu_reconnection_task(void *pv) {
+    ESP_LOGI(TAG, "ECU reconnection task started...");
+    
+    // Perform ECU connection verification
+    verify_ecu_connection();
+    
+    // Delete this task when done
+    vTaskDelete(NULL);
+}
+
+// Reset ECU error counters on successful data reception
+void reset_ecu_error_counters(void) {
+    consecutive_ecu_failures = 0;
+    // Gradually reduce error counts on success (but keep some history for resilience)
+    if (unable_to_connect_count > 0) unable_to_connect_count--;
+    if (can_error_count > 0) can_error_count--;
+}
+
 // Gentle ELM327 initialization to prevent disconnection
 void initialize_elm327(void) {
-    LOG_ELM(TAG, "Starting GENTLE ELM327 initialization...");
+    // Mark initialization as in progress
+    initialization_in_progress = true;
+    
+    ESP_LOGI(TAG, "🚀 === ELM327 INITIALIZATION SEQUENCE START ===");
+    ESP_LOGI(TAG, "🔧 Configuring ELM327 for Honda Civic (ISO 15765-4, 29-bit, 500k)");
     
     // Wait for ELM327 to settle after connection
-    LOG_ELM(TAG, "Waiting 3 seconds for ELM327 to settle...");
+    ESP_LOGI(TAG, "⏱️ Step 1: Waiting 3 seconds for ELM327 to settle...");
     vTaskDelay(pdMS_TO_TICKS(3000));
     
     // Send reset command
-    LOG_ELM(TAG, "Sending gentle ATZ (Reset)...");
+    ESP_LOGI(TAG, "🔄 Step 2: Sending reset command...");
     esp_err_t ret = elm327_send_command("ATZ");
     if (ret != ESP_OK) {
-        LOG_WARN(TAG, "Failed to send ATZ");
+        ESP_LOGW(TAG, "❌ Failed to send ATZ");
+        initialization_in_progress = false;  // Clear flag on failure
         return;
     }
     
     // Wait for reset to complete
-    LOG_ELM(TAG, "Waiting for ELM327 reset response...");
+    ESP_LOGI(TAG, "⏱️ Step 3: Waiting for reset to complete...");
     vTaskDelay(pdMS_TO_TICKS(3000));
     
     // Configure ELM327 for Honda Civic (ISO 15765-4 29-bit, 500k)
-    LOG_ELM(TAG, "Configuring protocol for Honda Civic...");
+    ESP_LOGI(TAG, "⚙️ Step 4: Configuring ELM327 parameters...");
     
     // Turn off echo
-    LOG_ELM(TAG, "Sending ATE0 (Echo OFF)...");
+    ESP_LOGI(TAG, "├─ Disabling echo...");
     ret = elm327_send_command("ATE0");
     if (ret != ESP_OK) {
-        LOG_WARN(TAG, "Failed to send ATE0");
+        ESP_LOGW(TAG, "❌ Failed to send ATE0");
+        initialization_in_progress = false;  // Clear flag on failure
         return;
     }
     vTaskDelay(pdMS_TO_TICKS(500));
     
     // Try automatic protocol detection first
-    LOG_ELM(TAG, "Sending AT SP 0 (Auto protocol detection)...");
+    ESP_LOGI(TAG, "├─ Setting auto protocol detection...");
     elm327_send_command("AT SP 0");
     vTaskDelay(pdMS_TO_TICKS(500));
     
     // Allow long frames (>7 bytes)
-    LOG_ELM(TAG, "Sending AT AL (Allow Long frames)...");
+    ESP_LOGI(TAG, "├─ Enabling long frames...");
     elm327_send_command("AT AL");
     vTaskDelay(pdMS_TO_TICKS(500));
     
     // Try broadcast first (more compatible)
-    LOG_ELM(TAG, "Sending AT SH 7DF (Broadcast address)...");
+    ESP_LOGI(TAG, "├─ Setting broadcast address...");
     elm327_send_command("AT SH 7DF");
     vTaskDelay(pdMS_TO_TICKS(500));
     
     // Enable ELM auto-formatting for ISO-TP
-    LOG_ELM(TAG, "Sending AT CAF1 (Auto-format ISO-TP)...");
+    ESP_LOGI(TAG, "├─ Enabling auto-format ISO-TP...");
     elm327_send_command("AT CAF1");
     vTaskDelay(pdMS_TO_TICKS(500));
     
     // Set shorter timeout (50ms instead of 100ms default)
-    LOG_ELM(TAG, "Sending AT ST 32 (50ms timeout)...");
+    ESP_LOGI(TAG, "├─ Setting shorter timeout...");
     elm327_send_command("AT ST 32");
     vTaskDelay(pdMS_TO_TICKS(500));
     
     // Headers off for shorter replies
-    LOG_ELM(TAG, "Sending ATH0 (Headers OFF)...");
+    ESP_LOGI(TAG, "├─ Disabling headers...");
     elm327_send_command("ATH0");
     vTaskDelay(pdMS_TO_TICKS(500));
     
     // Test basic connectivity with a simple command
-    LOG_ELM(TAG, "Testing connectivity with AT RV (voltage check)...");
+    ESP_LOGI(TAG, "├─ Testing basic connectivity...");
     elm327_send_command("AT RV");
     vTaskDelay(pdMS_TO_TICKS(1000));
     
     // Check what protocol was detected
-    LOG_ELM(TAG, "Checking detected protocol with AT DPN...");
+    ESP_LOGI(TAG, "├─ Checking detected protocol...");
     elm327_send_command("AT DPN");
     vTaskDelay(pdMS_TO_TICKS(1000));
     
     // Try a basic OBD test
-    LOG_ELM(TAG, "Testing basic OBD with 0100 (Supported PIDs)...");
+    ESP_LOGI(TAG, "├─ Testing basic OBD...");
     elm327_send_command("0100");
     vTaskDelay(pdMS_TO_TICKS(2000));
     
-    LOG_ELM(TAG, "If above shows CAN ERROR, check:");
-    LOG_ELM(TAG, "1. Car ignition is ON");
-    LOG_ELM(TAG, "2. Car engine is running");
-    LOG_ELM(TAG, "3. OBD port connection is secure");
+    ESP_LOGI(TAG, "If above shows CAN ERROR, check:");
+    ESP_LOGI(TAG, "1. Car ignition is ON");
+    ESP_LOGI(TAG, "2. Car engine is running");
+    ESP_LOGI(TAG, "3. OBD port connection is secure");
     
     // Mark as initialized
     elm327_initialized = true;
     elm_ready = true;  // Ready to accept commands
-    LOG_INFO(TAG, "ELM327 initialization complete - diagnostics above show readiness!");
+    initialization_in_progress = false;  // Initialization complete
+    ESP_LOGI(TAG, "✅ === ELM327 INITIALIZATION SEQUENCE COMPLETE ===");
     
-    // Signal that connection is ready
+    // Signal that ELM327 is ready
     xSemaphoreGive(connection_semaphore);
+    
+    // Now verify connection to vehicle ECU
+    verify_ecu_connection();
 }
 
 // ELM327 initialization task (runs in separate thread)

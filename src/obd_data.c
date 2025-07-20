@@ -84,6 +84,8 @@ void parse_multi_pid_line(char *line)
         return;
     }
     
+    bool data_parsed = false;  // Track if any valid data was parsed
+    
     // Now parse PID+data pairs
     while ((tok = strtok(NULL, " ")) != NULL) {
         // Stop at filler bytes (ELM pad)
@@ -114,20 +116,28 @@ void parse_multi_pid_line(char *line)
                                HEXBYTE_TO_INT(data2);
                 vehicle_data.rpm = raw / 4;
                 rpm_last_update = xTaskGetTickCount(); // Update timestamp
+                data_parsed = true; // Mark data as parsed
                 break;
             }
             case 0x0D:                      // Vehicle speed (1 byte)
                 vehicle_data.vehicle_speed = HEXBYTE_TO_INT(data1);
                 speed_last_update = xTaskGetTickCount(); // Update timestamp
+                data_parsed = true; // Mark data as parsed
                 break;
             case 0x11:                      // Throttle position (1 byte)
                 vehicle_data.throttle_position =
                     (HEXBYTE_TO_INT(data1) * 100) / 255;
                 throttle_last_update = xTaskGetTickCount(); // Update timestamp
+                data_parsed = true; // Mark data as parsed
                 break;
             default:
                 break;
         }
+    }
+
+    // Reset ECU error counters if any data was successfully parsed
+    if (data_parsed) {
+        reset_ecu_error_counters(); // Reset ECU disconnection error counters
     }
 }
 
@@ -174,12 +184,20 @@ void obd_task(void *pv) {
         // Wait for ELM327 to be connected and initialized
         if (connection_semaphore != NULL) {
             if (xSemaphoreTake(connection_semaphore, pdMS_TO_TICKS(1000)) == pdTRUE) {
-                LOG_INFO(TAG, "Starting OBD data polling...");
-                break;  // Connected and initialized, start polling
+                LOG_INFO(TAG, "ELM327 initialized, waiting for ECU connection...");
+                break;  // ELM327 ready, now wait for ECU
             }
         }
         vTaskDelay(pdMS_TO_TICKS(100));  // Check every 100ms
     }
+    
+    // Wait for ECU connection to be established
+    while (!ecu_connected) {
+        ESP_LOGI(TAG, "⏳ Waiting for ECU connection to be established...");
+        vTaskDelay(pdMS_TO_TICKS(5000));  // Check every 5 seconds instead of 1 second
+    }
+    
+    LOG_INFO(TAG, "🚗 ECU connected - Starting OBD data polling...");
     
     // Optimized OBD Data Polling - Production Ready
     ESP_LOGI(TAG, "🚀 Starting optimized OBD polling system");
@@ -187,10 +205,37 @@ void obd_task(void *pv) {
     
     static uint8_t phase = 0;
     static bool use_individual_pids = false;
-    static uint8_t can_error_count = 0;
     static TickType_t last_success_time = 0;
+    static TickType_t last_ecu_check = 0;
     
     while (1) {
+        // Check if ECU is still connected
+        if (!ecu_connected) {
+            ESP_LOGW(TAG, "🔴 ECU disconnected during polling - waiting for reconnection...");
+            
+            // Wait for ECU connection to be re-established
+            while (!ecu_connected) {
+                ESP_LOGI(TAG, "⏳ Waiting for ECU reconnection...");
+                vTaskDelay(pdMS_TO_TICKS(3000));  // Check every 3 seconds
+            }
+            
+            ESP_LOGI(TAG, "✅ ECU reconnected - resuming OBD data polling");
+            
+            // Reset state variables after reconnection
+            phase = 0;
+            use_individual_pids = false;
+            last_success_time = xTaskGetTickCount();
+            last_ecu_check = xTaskGetTickCount();
+        }
+        
+        // Periodic ECU connectivity check (every 30 seconds)
+        TickType_t current_time = xTaskGetTickCount();
+        if ((current_time - last_ecu_check) > pdMS_TO_TICKS(30000)) {
+            ESP_LOGD(TAG, "🔍 Performing periodic ECU connectivity check...");
+            check_ecu_disconnection();
+            last_ecu_check = current_time;
+        }
+        
         if (is_connected && elm327_initialized) {
             
             // Check if we should switch to individual PIDs due to CAN errors
@@ -261,7 +306,6 @@ void obd_task(void *pv) {
             ESP_LOGI(TAG, "⏳ Waiting for ELM327 connection...");
             // Reset strategy when disconnected
             use_individual_pids = false;
-            can_error_count = 0;
             last_success_time = 0;
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
