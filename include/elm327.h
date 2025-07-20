@@ -17,7 +17,6 @@ extern uint16_t rx_buffer_len;
 
 // Function declarations
 void elm327_init_system(void);
-void send_obd_command(const char *cmd);
 void initialize_elm327(void);
 void initialize_elm327_task(void *pv);
 void process_received_data(const char *data, uint16_t len);
@@ -32,6 +31,7 @@ void reset_ecu_error_counters(void);
 
 // ELM327 communication
 esp_err_t elm327_send_command(const char *cmd);
+esp_err_t elm327_send_command_with_options(const char *cmd, bool wait_for_prompt);
 void elm327_handle_response(const char *response);
 void process_obd_response(const char *response);
 

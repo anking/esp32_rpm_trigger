@@ -54,29 +54,8 @@ void elm327_init_system(void) {
     LOG_VERBOSE(TAG, "ELM327 system initialized");
 }
 
-// Send OBD command to ELM327 (DEPRECATED - use elm327_send_command instead)
-void send_obd_command(const char *cmd) {
-    ESP_LOGW(TAG, "⚠️ DEPRECATED: send_obd_command() - use elm327_send_command() instead");
-    
-    if (is_connected && elm327_initialized && spp_handle) {
-        // Always log outgoing commands
-        ESP_LOGI(TAG, "⬆️ SEND: %s", cmd);
-        
-        // Format command with carriage return
-        char formatted_cmd[32];
-        snprintf(formatted_cmd, sizeof(formatted_cmd), "%s\r", cmd);
-        
-        esp_err_t ret = esp_spp_write(spp_handle, strlen(formatted_cmd), (uint8_t *)formatted_cmd);
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "⚠️ Failed to send command: %s", esp_err_to_name(ret));
-        }
-    } else {
-        ESP_LOGW(TAG, "⚠️ Cannot send command '%s' - not connected or not initialized", cmd);
-    }
-}
-
 // ELM327 specific command sending with error handling
-esp_err_t elm327_send_command(const char *cmd) {
+esp_err_t elm327_send_command_with_options(const char *cmd, bool wait_for_prompt) {
     if (!is_connected || !spp_handle) {
         ESP_LOGW(TAG, "⚠️ Not connected to ELM327");
         return ESP_ERR_INVALID_STATE;
@@ -85,24 +64,28 @@ esp_err_t elm327_send_command(const char *cmd) {
     // Always log outgoing commands
     ESP_LOGI(TAG, "⬆️ SEND: %s", cmd);
     
-    // Wait for ELM327 to be ready (prompt detected) with timeout
-    TickType_t start_time = xTaskGetTickCount();
-    TickType_t timeout = pdMS_TO_TICKS(2000);  // 2 second timeout
-    
-    while (!elm_ready) {
-        vTaskDelay(pdMS_TO_TICKS(5));  // Wait in 5ms slots
+    // Wait for ELM327 to be ready (prompt detected) with timeout - only if requested
+    if (wait_for_prompt) {
+        TickType_t start_time = xTaskGetTickCount();
+        TickType_t timeout = pdMS_TO_TICKS(2000);  // 2 second timeout
         
-        // Check for timeout to prevent watchdog issues
-        if ((xTaskGetTickCount() - start_time) > timeout) {
-            if (initialization_in_progress) {
-                ESP_LOGD(TAG, "🔧 ELM327 busy during initialization, sending anyway");
-            } else {
-                ESP_LOGW(TAG, "⚠️ Timeout waiting for ELM327 prompt, sending anyway");
+        while (!elm_ready) {
+            vTaskDelay(pdMS_TO_TICKS(5));  // Wait in 5ms slots
+            
+            // Check for timeout to prevent watchdog issues
+            if ((xTaskGetTickCount() - start_time) > timeout) {
+                if (initialization_in_progress) {
+                    ESP_LOGD(TAG, "🔧 ELM327 busy during initialization, proceeding with send");
+                } else {
+                    ESP_LOGW(TAG, "⚠️ Timeout waiting for prompt, proceeding with send");
+                }
+                break;
             }
-            break;
         }
+        elm_ready = false;  // Clear flag before sending
+    } else {
+        ESP_LOGD(TAG, "Skipping prompt wait for ECU test command");
     }
-    elm_ready = false;  // Clear flag before sending
     
     char formatted_cmd[32];
     int len = snprintf(formatted_cmd, sizeof(formatted_cmd), "%s\r", cmd);
@@ -115,13 +98,18 @@ esp_err_t elm327_send_command(const char *cmd) {
     return ret;
 }
 
+// Standard command sending (waits for prompt)
+esp_err_t elm327_send_command(const char *cmd) {
+    return elm327_send_command_with_options(cmd, true);
+}
+
 // Handle ELM327 responses
 void elm327_handle_response(const char *response) {
     if (!response || strlen(response) == 0) {
         return;
     }
     
-    ESP_LOGI(TAG, "⬇️ RECV: '%s'", response);
+    ESP_LOGI(TAG, "⬇️ RECV: %s", response);
     
     // Check for common ELM327 responses
     if (strstr(response, "ELM327")) {
@@ -188,27 +176,38 @@ void process_received_data(const char *data, uint16_t len) {
         return;
     }
     
+    // Debug: Log raw received data
+    ESP_LOGD(TAG, "Raw data received (%d bytes): %.*s", len, len, data);
+    
     // Add received data to buffer
     for (uint16_t i = 0; i < len && rx_buffer_len < (RX_BUFFER_SIZE - 1); i++) {
         char c = data[i];
         
-        // Check for end of response (carriage return or newline)
-        if (c == '\r' || c == '\n') {
+        // Check for end of response (carriage return)
+        if (c == '\r') {
             if (rx_buffer_len > 0) {
                 rx_buffer[rx_buffer_len] = '\0';  // Null terminate
                 
-                ESP_LOGD(TAG, "Processing response: %s", rx_buffer);
+                ESP_LOGD(TAG, "Processing response (len=%d): '%s'", rx_buffer_len, rx_buffer);
                 elm327_handle_response(rx_buffer);
                 
                 // Clear buffer for next response
                 rx_buffer_len = 0;
                 memset(rx_buffer, 0, RX_BUFFER_SIZE);
             }
+        } else if (c == '\n') {
+            // Ignore line feed (often follows carriage return) - prevents duplicate processing
+            ESP_LOGD(TAG, "Ignoring LF character");
+            continue;
         } else if (c == '>') {
             // Prompt detected - ELM327 is ready for next command
             elm_ready = true;
+            ESP_LOGD(TAG, "🔥 Prompt '>' detected, elm_ready=true");
         } else if (c >= 32 && c <= 126) {  // Printable ASCII characters
             rx_buffer[rx_buffer_len++] = c;
+        } else {
+            // Log any unexpected characters
+            ESP_LOGD(TAG, "Unexpected char: 0x%02X (%d)", c, c);
         }
     }
 }
@@ -226,8 +225,8 @@ bool test_ecu_connectivity(void) {
     memset(rx_buffer, 0, RX_BUFFER_SIZE);
     rx_buffer_len = 0;
     
-    // Send basic OBD test command (get supported PIDs)
-    esp_err_t ret = elm327_send_command("0100");
+    // Send basic OBD test command (get supported PIDs) - skip prompt wait for ECU testing
+    esp_err_t ret = elm327_send_command_with_options("0100", false);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "❌ Failed to send ECU test command");
         return false;
