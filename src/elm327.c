@@ -16,6 +16,10 @@ SemaphoreHandle_t connection_semaphore;
 char rx_buffer[RX_BUFFER_SIZE];
 uint16_t rx_buffer_len = 0;
 
+// Command pacing - wait for prompt before sending next command
+static volatile bool elm_ready = false;
+static uint8_t consecutive_fail = 0;
+
 // Initialize ELM327 system (semaphore, etc.)
 void elm327_init_system(void) {
     // Create semaphore for connection synchronization
@@ -35,8 +39,6 @@ void elm327_init_system(void) {
 // Send OBD command to ELM327
 void send_obd_command(const char *cmd) {
     if (is_connected && elm327_initialized && spp_handle) {
-        LOG_DEBUG(TAG, "Sending OBD command: %s", cmd);
-        
         // Format command with carriage return
         char formatted_cmd[32];
         snprintf(formatted_cmd, sizeof(formatted_cmd), "%s\r", cmd);
@@ -57,7 +59,22 @@ esp_err_t elm327_send_command(const char *cmd) {
         return ESP_ERR_INVALID_STATE;
     }
     
-    char formatted_cmd[64];
+    // Wait for ELM327 to be ready (prompt detected) with timeout
+    TickType_t start_time = xTaskGetTickCount();
+    TickType_t timeout = pdMS_TO_TICKS(2000);  // 2 second timeout
+    
+    while (!elm_ready) {
+        vTaskDelay(pdMS_TO_TICKS(5));  // Wait in 5ms slots
+        
+        // Check for timeout to prevent watchdog issues
+        if ((xTaskGetTickCount() - start_time) > timeout) {
+            ESP_LOGW(TAG, "⚠️ Timeout waiting for ELM327 prompt, sending anyway");
+            break;
+        }
+    }
+    elm_ready = false;  // Clear flag before sending
+    
+    char formatted_cmd[32];
     int len = snprintf(formatted_cmd, sizeof(formatted_cmd), "%s\r", cmd);
     
     esp_err_t ret = esp_spp_write(spp_handle, len, (uint8_t *)formatted_cmd);
@@ -76,13 +93,22 @@ void elm327_handle_response(const char *response) {
         return;
     }
     
-    ESP_LOGD(TAG, "📥 ELM327 response: %s", response);
+    ESP_LOGI(TAG, "📥 ELM327 RAW response: '%s'", response);
     
     // Check for common ELM327 responses
     if (strstr(response, "ELM327")) {
         ESP_LOGI(TAG, "🔧 ELM327 device identified: %s", response);
     } else if (strstr(response, "OK")) {
         ESP_LOGD(TAG, "✅ Command acknowledged");
+    } else if (strstr(response, "CAN ERROR") || strstr(response, "NO DATA")) {
+        ESP_LOGW(TAG, "⚠️ CAN/ECU error: %s", response);
+        if (++consecutive_fail >= 3) {
+            ESP_LOGW(TAG, "⚠️ 3 consecutive failures, backing off...");
+            consecutive_fail = 0;
+            // Slow-down: pause for 300ms
+            vTaskDelay(pdMS_TO_TICKS(300));
+        }
+        return;
     } else if (strstr(response, "ERROR")) {
         ESP_LOGW(TAG, "⚠️ ELM327 error: %s", response);
     } else if (strstr(response, "UNABLE TO CONNECT")) {
@@ -90,17 +116,15 @@ void elm327_handle_response(const char *response) {
     } else if (strstr(response, "SEARCHING")) {
         ESP_LOGD(TAG, "🔍 ELM327 searching for ECU...");
     } else {
-        // Process as potential OBD data
-        vehicle_data_t *data = &vehicle_data;
+        // Successfully received data - reset failure counter
+        consecutive_fail = 0;
         
-        // Try to parse different OBD responses
-        if (strstr(response, "41 0C")) {
-            data->rpm = parse_rpm(response);
-        } else if (strstr(response, "41 11")) {
-            data->throttle_position = parse_throttle(response);
-        } else if (strstr(response, "41 0D")) {
-            data->vehicle_speed = parse_speed(response);
-        }
+        // Process as potential OBD data
+        /* Handle possible multi-PID payload */
+        char response_copy[256];
+        strncpy(response_copy, response, sizeof(response_copy) - 1);
+        response_copy[sizeof(response_copy) - 1] = '\0';
+        parse_multi_pid_line(response_copy);
     }
 }
 
@@ -126,6 +150,9 @@ void process_received_data(const char *data, uint16_t len) {
                 rx_buffer_len = 0;
                 memset(rx_buffer, 0, RX_BUFFER_SIZE);
             }
+        } else if (c == '>') {
+            // Prompt detected - ELM327 is ready for next command
+            elm_ready = true;
         } else if (c >= 32 && c <= 126) {  // Printable ASCII characters
             rx_buffer[rx_buffer_len++] = c;
         }
@@ -152,6 +179,9 @@ void initialize_elm327(void) {
     LOG_ELM(TAG, "Waiting for ELM327 reset response...");
     vTaskDelay(pdMS_TO_TICKS(3000));
     
+    // Configure ELM327 for Honda Civic (ISO 15765-4 29-bit, 500k)
+    LOG_ELM(TAG, "Configuring protocol for Honda Civic...");
+    
     // Turn off echo
     LOG_ELM(TAG, "Sending ATE0 (Echo OFF)...");
     ret = elm327_send_command("ATE0");
@@ -159,13 +189,62 @@ void initialize_elm327(void) {
         LOG_WARN(TAG, "Failed to send ATE0");
         return;
     }
+    vTaskDelay(pdMS_TO_TICKS(500));
     
-    // Wait for echo off response
+    // Try automatic protocol detection first
+    LOG_ELM(TAG, "Sending AT SP 0 (Auto protocol detection)...");
+    elm327_send_command("AT SP 0");
+    vTaskDelay(pdMS_TO_TICKS(500));
+    
+    // Allow long frames (>7 bytes)
+    LOG_ELM(TAG, "Sending AT AL (Allow Long frames)...");
+    elm327_send_command("AT AL");
+    vTaskDelay(pdMS_TO_TICKS(500));
+    
+    // Try broadcast first (more compatible)
+    LOG_ELM(TAG, "Sending AT SH 7DF (Broadcast address)...");
+    elm327_send_command("AT SH 7DF");
+    vTaskDelay(pdMS_TO_TICKS(500));
+    
+    // Enable ELM auto-formatting for ISO-TP
+    LOG_ELM(TAG, "Sending AT CAF1 (Auto-format ISO-TP)...");
+    elm327_send_command("AT CAF1");
+    vTaskDelay(pdMS_TO_TICKS(500));
+    
+    // Set shorter timeout (50ms instead of 100ms default)
+    LOG_ELM(TAG, "Sending AT ST 32 (50ms timeout)...");
+    elm327_send_command("AT ST 32");
+    vTaskDelay(pdMS_TO_TICKS(500));
+    
+    // Headers off for shorter replies
+    LOG_ELM(TAG, "Sending ATH0 (Headers OFF)...");
+    elm327_send_command("ATH0");
+    vTaskDelay(pdMS_TO_TICKS(500));
+    
+    // Test basic connectivity with a simple command
+    LOG_ELM(TAG, "Testing connectivity with AT RV (voltage check)...");
+    elm327_send_command("AT RV");
     vTaskDelay(pdMS_TO_TICKS(1000));
+    
+    // Check what protocol was detected
+    LOG_ELM(TAG, "Checking detected protocol with AT DPN...");
+    elm327_send_command("AT DPN");
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    
+    // Try a basic OBD test
+    LOG_ELM(TAG, "Testing basic OBD with 0100 (Supported PIDs)...");
+    elm327_send_command("0100");
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    
+    LOG_ELM(TAG, "If above shows CAN ERROR, check:");
+    LOG_ELM(TAG, "1. Car ignition is ON");
+    LOG_ELM(TAG, "2. Car engine is running");
+    LOG_ELM(TAG, "3. OBD port connection is secure");
     
     // Mark as initialized
     elm327_initialized = true;
-    LOG_INFO(TAG, "Basic ELM327 initialization complete!");
+    elm_ready = true;  // Ready to accept commands
+    LOG_INFO(TAG, "ELM327 initialization complete - diagnostics above show readiness!");
     
     // Signal that connection is ready
     xSemaphoreGive(connection_semaphore);

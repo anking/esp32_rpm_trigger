@@ -1,6 +1,7 @@
 #include "esp_log.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 #include "logging_config.h"
 #include "obd_data.h"
@@ -10,12 +11,125 @@
 
 static const char *TAG = "OBD_DATA";
 
+#define HEXBYTE_TO_INT(ptr)  ((uint8_t)strtol((ptr), NULL, 16))
+
 // Global vehicle data instance
 vehicle_data_t vehicle_data = {
     .rpm = 0,
     .throttle_position = 0,
     .vehicle_speed = 0
 };
+
+// Timestamp tracking for data freshness (in FreeRTOS ticks)
+static TickType_t rpm_last_update = 0;
+static TickType_t throttle_last_update = 0;
+static TickType_t speed_last_update = 0;
+
+#define DATA_TIMEOUT_MS 500
+#define DATA_TIMEOUT_TICKS pdMS_TO_TICKS(DATA_TIMEOUT_MS)
+
+// Check for stale data and reset values older than timeout
+static void check_and_reset_stale_data(bool using_individual_pids) {
+    TickType_t current_time = xTaskGetTickCount();
+    
+    // Adjust timeout based on polling strategy
+    TickType_t timeout = using_individual_pids ? 
+        pdMS_TO_TICKS(1000) :  // 1 second for individual PIDs (750ms cycle + margin)
+        pdMS_TO_TICKS(600);    // 600ms for multi-PID (500ms cycle + margin)
+    
+    // Check RPM freshness
+    if ((current_time - rpm_last_update) > timeout) {
+        if (vehicle_data.rpm != 0) {
+            vehicle_data.rpm = 0;
+            ESP_LOGW(TAG, "⚠️ RPM data stale, reset to 0");
+        }
+    }
+    
+    // Check throttle freshness  
+    if ((current_time - throttle_last_update) > timeout) {
+        if (vehicle_data.throttle_position != 0) {
+            vehicle_data.throttle_position = 0;
+            ESP_LOGW(TAG, "⚠️ Throttle data stale, reset to 0");
+        }
+    }
+    
+    // Check speed freshness
+    if ((current_time - speed_last_update) > timeout) {
+        if (vehicle_data.vehicle_speed != 0) {
+            vehicle_data.vehicle_speed = 0;
+            ESP_LOGW(TAG, "⚠️ Speed data stale, reset to 0");
+        }
+    }
+}
+
+// Parse multi-PID response line
+void parse_multi_pid_line(char *line)
+{
+    /* Example after trimming CR/LF + prompt:
+       "41 0C 1A F8 41 0D 3C 41 11 5A" */
+
+    // Handle lines that start with "0: " or similar prefixes
+    char *data_start = strstr(line, "41 ");
+    if (data_start == NULL) {
+        return;   // not a Mode-01 reply
+    }
+    
+    // Use the data starting from "41" instead of the beginning of the line
+    line = data_start;
+
+    char *tok = strtok(line, " ");
+    
+    // First token should be "41" (Mode 1 response)
+    if (!tok || strcmp(tok, "41") != 0) {
+        return;
+    }
+    
+    // Now parse PID+data pairs
+    while ((tok = strtok(NULL, " ")) != NULL) {
+        // Stop at filler bytes (ELM pad)
+        if (strcmp(tok, "55") == 0) {
+            break;
+        }
+        
+        // This token should be a PID
+        uint8_t pid_val = HEXBYTE_TO_INT(tok);
+        
+        char *data1 = strtok(NULL, " ");   // first data byte
+        if (!data1) {
+            break;
+        }
+        
+        char *data2 = NULL;
+        // Check if this PID needs two data bytes
+        if (pid_val == 0x0C) {  // RPM needs 2 bytes
+            data2 = strtok(NULL, " ");
+        }
+        
+        switch (pid_val) {
+            case 0x0C: {                   // RPM (needs two bytes)
+                if (!data2) {
+                    break;
+                }
+                uint16_t raw = (HEXBYTE_TO_INT(data1) << 8) |
+                               HEXBYTE_TO_INT(data2);
+                vehicle_data.rpm = raw / 4;
+                rpm_last_update = xTaskGetTickCount(); // Update timestamp
+                break;
+            }
+            case 0x0D:                      // Vehicle speed (1 byte)
+                vehicle_data.vehicle_speed = HEXBYTE_TO_INT(data1);
+                speed_last_update = xTaskGetTickCount(); // Update timestamp
+                break;
+            case 0x11:                      // Throttle position (1 byte)
+                vehicle_data.throttle_position =
+                    (HEXBYTE_TO_INT(data1) * 100) / 255;
+                throttle_last_update = xTaskGetTickCount(); // Update timestamp
+                break;
+            default:
+                break;
+        }
+    }
+}
 
 // Initialize OBD data system
 void obd_data_init(void) {
@@ -24,45 +138,14 @@ void obd_data_init(void) {
     vehicle_data.throttle_position = 0;
     vehicle_data.vehicle_speed = 0;
     
+    // Initialize timestamps to current time
+    TickType_t current_time = xTaskGetTickCount();
+    rpm_last_update = current_time;
+    throttle_last_update = current_time;
+    speed_last_update = current_time;
+    
     LOG_VERBOSE(TAG, "OBD data system initialized");
 }
-
-// Parse RPM response from ELM327
-uint32_t parse_rpm(const char *response) {
-    // Example response: "41 0C 1A F8\r"
-    int A, B;
-    if (sscanf(response, "41 0C %x %x", &A, &B) == 2) {
-        uint32_t rpm = ((A * 256) + B) / 4;
-        ESP_LOGD(TAG, "Parsed RPM: %lu", rpm);
-        return rpm;
-    }
-    return 0;
-}
-
-// Parse throttle position response from ELM327
-uint8_t parse_throttle(const char *response) {
-    // Example response: "41 11 5A\r" (90% throttle)
-    int A;
-    if (sscanf(response, "41 11 %x", &A) == 1) {
-        uint8_t throttle = (A * 100) / 255;
-        ESP_LOGD(TAG, "Parsed throttle: %d%%", throttle);
-        return throttle;
-    }
-    return 0;
-}
-
-// Parse vehicle speed response from ELM327
-uint8_t parse_speed(const char *response) {
-    // Example response: "41 0D 3C\r" (60 km/h)
-    int A;
-    if (sscanf(response, "41 0D %x", &A) == 1) {
-        uint8_t speed = A;  // Speed is directly in km/h
-        ESP_LOGD(TAG, "Parsed speed: %d km/h", speed);
-        return speed;
-    }
-    return 0;
-}
-
 
 
 // Display current vehicle data
@@ -98,33 +181,88 @@ void obd_task(void *pv) {
         vTaskDelay(pdMS_TO_TICKS(100));  // Check every 100ms
     }
     
-    // Main OBD polling loop
+    // Optimized OBD Data Polling - Production Ready
+    ESP_LOGI(TAG, "🚀 Starting optimized OBD polling system");
+    ESP_LOGI(TAG, "📊 Two-phase strategy: 010C11 → 010D");
+    
+    static uint8_t phase = 0;
+    static bool use_individual_pids = false;
+    static uint8_t can_error_count = 0;
+    static TickType_t last_success_time = 0;
+    
     while (1) {
         if (is_connected && elm327_initialized) {
-            // Send OBD commands for vehicle data
-            send_obd_command("010C");  // RPM
-            vTaskDelay(pdMS_TO_TICKS(50));  // Small delay between commands
             
-            send_obd_command("0111");  // Throttle position
-            vTaskDelay(pdMS_TO_TICKS(50));
-            
-            send_obd_command("010D");  // Vehicle speed
-            vTaskDelay(pdMS_TO_TICKS(50));
-            
-
-            
-            // Log current status every ~500ms (close to user's request)
-            static int log_counter = 0;
-            if (++log_counter >= 1) {  // Log every 400ms (1 * 400ms ≈ 500ms)
-                log_vehicle_status();
-                log_counter = 0;
+            // Check if we should switch to individual PIDs due to CAN errors
+            TickType_t current_time = xTaskGetTickCount();
+            if ((current_time - last_success_time) > pdMS_TO_TICKS(5000)) {
+                if (!use_individual_pids) {
+                    ESP_LOGW(TAG, "⚠️ Switching to individual PID requests due to errors");
+                    use_individual_pids = true;
+                }
             }
             
-            // Wait before next poll cycle
-            vTaskDelay(pdMS_TO_TICKS(400));  // Poll every 400ms
+            // Adaptive polling strategy
+            if (use_individual_pids) {
+                // Fallback: Individual PID requests
+                switch (phase % 3) {
+                    case 0:
+                        elm327_send_command("010C");  // RPM only
+                        break;
+                    case 1:
+                        elm327_send_command("0111");  // Throttle only
+                        break;
+                    case 2:
+                        elm327_send_command("010D");  // Speed only
+                        break;
+                }
+                phase = (phase + 1) % 3;
+            } else {
+                // Optimized: Multi-PID requests
+                switch (phase) {
+                    case 0:
+                        // Phase 0: RPM + Throttle (critical engine data)
+                        elm327_send_command("010C11");
+                        break;
+                    case 1:
+                        // Phase 1: Vehicle Speed
+                        elm327_send_command("010D");
+                        break;
+                }
+                // Alternate phases every 250ms
+                phase ^= 1;
+            }
+            
+            // Check for stale data and reset if needed
+            check_and_reset_stale_data(use_individual_pids);
+            
+            // Log status (adjust frequency based on mode)
+            if (use_individual_pids) {
+                // Log every cycle when using individual PIDs
+                if (phase == 0) {
+                    log_vehicle_status();
+                }
+            } else {
+                // Log once per complete cycle (every 500ms) for multi-PID
+                if (phase == 0) {
+                    log_vehicle_status();
+                }
+            }
+            
+            // Update success time if we have valid data
+            if (vehicle_data.rpm > 0 || vehicle_data.throttle_position > 0 || vehicle_data.vehicle_speed > 0) {
+                last_success_time = current_time;
+            }
+            
+            // Wait before next phase
+            vTaskDelay(pdMS_TO_TICKS(150));
+            
         } else {
-            // Not connected, wait longer
-            LOG_DEBUG(TAG, "Waiting for connection...");
+            ESP_LOGI(TAG, "⏳ Waiting for ELM327 connection...");
+            // Reset strategy when disconnected
+            use_individual_pids = false;
+            can_error_count = 0;
+            last_success_time = 0;
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
     }

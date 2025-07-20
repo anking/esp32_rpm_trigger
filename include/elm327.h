@@ -10,7 +10,7 @@ extern bool elm327_initialized;
 extern SemaphoreHandle_t connection_semaphore;
 
 // RX Buffer for ELM327 responses
-#define RX_BUFFER_SIZE 256
+#define RX_BUFFER_SIZE 384   /* multi-PID lines are longer */
 extern char rx_buffer[RX_BUFFER_SIZE];
 extern uint16_t rx_buffer_len;
 

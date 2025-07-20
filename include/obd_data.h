@@ -17,10 +17,8 @@ extern vehicle_data_t vehicle_data;
 void obd_data_init(void);
 void obd_task(void *pv);
 
-// OBD response parsing functions
-uint32_t parse_rpm(const char *response);
-uint8_t parse_throttle(const char *response);
-uint8_t parse_speed(const char *response);
+// Multi-PID response parsing
+void parse_multi_pid_line(char *line);
 
 // Data display
 void display_vehicle_data(void);
