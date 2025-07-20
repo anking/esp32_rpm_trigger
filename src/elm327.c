@@ -214,7 +214,14 @@ void process_received_data(const char *data, uint16_t len) {
 
 // Test ECU connectivity with a basic OBD command
 bool test_ecu_connectivity(void) {
+    // Check prerequisites
+    if (!is_connected) {
+        ESP_LOGD(TAG, "❌ Bluetooth not connected - cannot test ECU");
+        return false;
+    }
+    
     if (!elm327_initialized) {
+        ESP_LOGD(TAG, "❌ ELM327 not initialized - cannot test ECU");
         return false;
     }
     
@@ -282,6 +289,20 @@ void verify_ecu_connection(void) {
     int attempt = 1;
     
     while (!ecu_connected) {
+        // Check if Bluetooth is still connected
+        if (!is_connected) {
+            ESP_LOGW(TAG, "🔴 Bluetooth disconnected during ECU verification - stopping");
+            ecu_connected = false;
+            return;
+        }
+        
+        // Check if ELM327 is still initialized
+        if (!elm327_initialized) {
+            ESP_LOGW(TAG, "🔴 ELM327 no longer initialized - stopping ECU verification");
+            ecu_connected = false;
+            return;
+        }
+        
         ESP_LOGI(TAG, "🔄 ECU Connection Attempt #%d", attempt);
         
         if (test_ecu_connectivity()) {
@@ -347,6 +368,13 @@ void reset_ecu_connection(void) {
 // ECU reconnection task (runs in separate thread)
 void ecu_reconnection_task(void *pv) {
     ESP_LOGI(TAG, "ECU reconnection task started...");
+    
+    // Check if Bluetooth is still connected before attempting reconnection
+    if (!is_connected) {
+        ESP_LOGW(TAG, "🔴 Bluetooth disconnected - aborting ECU reconnection");
+        vTaskDelete(NULL);
+        return;
+    }
     
     // Perform ECU connection verification
     verify_ecu_connection();

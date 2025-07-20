@@ -178,9 +178,17 @@ void log_vehicle_status(void) {
 
 // OBD data polling task
 void obd_task(void *pv) {
+    restart_obd_task:
     LOG_VERBOSE(TAG, "OBD Task started - waiting for Bluetooth connection...");
     
     while (1) {
+        // Check if Bluetooth is connected
+        if (!is_connected) {
+            ESP_LOGI(TAG, "⏳ Waiting for Bluetooth connection...");
+            vTaskDelay(pdMS_TO_TICKS(3000));  // Check every 3 seconds
+            continue;
+        }
+        
         // Wait for ELM327 to be connected and initialized
         if (connection_semaphore != NULL) {
             if (xSemaphoreTake(connection_semaphore, pdMS_TO_TICKS(1000)) == pdTRUE) {
@@ -192,9 +200,17 @@ void obd_task(void *pv) {
     }
     
     // Wait for ECU connection to be established
-    while (!ecu_connected) {
+    while (!ecu_connected && is_connected) {  // Also check Bluetooth is still connected
         ESP_LOGI(TAG, "⏳ Waiting for ECU connection to be established...");
         vTaskDelay(pdMS_TO_TICKS(5000));  // Check every 5 seconds instead of 1 second
+    }
+    
+    if (!is_connected) {
+        ESP_LOGW(TAG, "🔴 Bluetooth disconnected during ECU wait - restarting");
+        // Don't start OBD polling, will restart from the beginning
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        // Continue will restart the function from the beginning
+        goto restart_obd_task;
     }
     
     LOG_INFO(TAG, "🚗 ECU connected - Starting OBD data polling...");
@@ -209,14 +225,38 @@ void obd_task(void *pv) {
     static TickType_t last_ecu_check = 0;
     
     while (1) {
+        // Check if Bluetooth is still connected
+        if (!is_connected) {
+            ESP_LOGW(TAG, "🔴 Bluetooth disconnected - stopping OBD polling");
+            
+            // Reset state variables when Bluetooth disconnects
+            phase = 0;
+            use_individual_pids = false;
+            last_success_time = 0;
+            last_ecu_check = 0;
+            
+            // Wait for Bluetooth reconnection
+            while (!is_connected) {
+                ESP_LOGI(TAG, "⏳ Waiting for Bluetooth reconnection...");
+                vTaskDelay(pdMS_TO_TICKS(3000));  // Check every 3 seconds
+            }
+            
+            ESP_LOGI(TAG, "✅ Bluetooth reconnected - waiting for ELM327 initialization");
+            continue;  // Restart the main loop
+        }
+        
         // Check if ECU is still connected
         if (!ecu_connected) {
             ESP_LOGW(TAG, "🔴 ECU disconnected during polling - waiting for reconnection...");
             
             // Wait for ECU connection to be re-established
-            while (!ecu_connected) {
+            while (!ecu_connected && is_connected) {  // Also check Bluetooth is still connected
                 ESP_LOGI(TAG, "⏳ Waiting for ECU reconnection...");
                 vTaskDelay(pdMS_TO_TICKS(3000));  // Check every 3 seconds
+            }
+            
+            if (!is_connected) {
+                continue;  // Bluetooth disconnected, restart main loop
             }
             
             ESP_LOGI(TAG, "✅ ECU reconnected - resuming OBD data polling");

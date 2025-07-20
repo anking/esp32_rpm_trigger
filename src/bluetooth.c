@@ -18,6 +18,11 @@ uint32_t spp_handle = 0;
 uint8_t target_elm327_bda[6] = ELM327_BT_ADDR;
 static int connection_attempt = 0;
 
+// Forward declaration
+void restart_discovery_task(void *pvParameters);
+void discovery_timeout_task(void *pvParameters);
+void reconnection_watchdog_task(void *pvParameters);
+
 // GAP callback for device discovery
 static void gap_callback(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param) {
     switch (event) {
@@ -69,8 +74,14 @@ static void gap_callback(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *par
         case ESP_BT_GAP_DISC_STATE_CHANGED_EVT:
             if (param->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STOPPED) {
                 ESP_LOGI(TAG, "🔍 Device discovery stopped");
+                is_searching = false;
+                
                 if (!is_connecting && !is_connected) {
-                    ESP_LOGI(TAG, "⏳ Connection attempt in progress - waiting...");
+                    // Discovery completed but device not found - restart discovery
+                    ESP_LOGW(TAG, "🔄 ELM327 not found during discovery - will retry in 5 seconds");
+                    
+                    // Create a task to restart discovery after delay (non-blocking)
+                    xTaskCreate(restart_discovery_task, "restart_discovery", 2048, NULL, 3, NULL);
                 }
             }
             break;
@@ -117,6 +128,7 @@ static void spp_callback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param) {
             is_connecting = false;   // Reset connection attempt state
             is_connected = false;    // No longer connected
             elm327_initialized = false;
+            ecu_connected = false;   // Reset ECU connection state
             led_set_connected(false);  // Turn off LED
             
             handle_connection_failure();
@@ -139,9 +151,8 @@ static void spp_callback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param) {
     }
 }
 
-// Handle connection failures with simple retry logic
+// Handle connection failures with infinite retry logic
 void handle_connection_failure(void) {
-    // Simple retry: SCN 2 first, then SCN 1, then restart discovery
     connection_attempt++;
     ESP_LOGI(TAG, "🔄 Connection failed - retry attempt #%d...", connection_attempt);
     
@@ -164,18 +175,18 @@ void handle_connection_failure(void) {
             return;
         }
     } else {
-        // Reset counter and restart discovery
-        ESP_LOGI(TAG, "🔄 Retries exhausted, restarting discovery...");
-        connection_attempt = 0;
+        // Reset counter and restart discovery (infinite reconnection)
+        ESP_LOGI(TAG, "🔄 Direct connection attempts failed, restarting discovery...");
+        connection_attempt = 0;  // Reset counter for next cycle
     }
     
-    // Restart discovery
+    // Always restart discovery if direct connection failed
     ESP_LOGI(TAG, "🔍 Restarting device discovery...");
     vTaskDelay(pdMS_TO_TICKS(1000));
     start_device_discovery();
 }
 
-// Start device discovery
+// Start device discovery with timeout protection
 void start_device_discovery(void) {
     if (is_connecting || is_connected) {
         ESP_LOGD(TAG, "🔗 Already connecting/connected, skipping discovery");
@@ -189,9 +200,16 @@ void start_device_discovery(void) {
         ESP_LOGI(TAG, "✅ Device discovery started successfully");
         led_set_searching(true);  // Start LED search indicator
         ESP_LOGI(TAG, "🔍 Device discovery started - looking for ELM327...");
+        
+        // Create timeout protection task - restart discovery if it takes too long
+        xTaskCreate(discovery_timeout_task, "discovery_timeout", 2048, NULL, 3, NULL);
+        
     } else {
         ESP_LOGE(TAG, "❌ Failed to start device discovery: %s", esp_err_to_name(ret));
         is_searching = false;
+        
+        // Retry discovery after delay
+        xTaskCreate(restart_discovery_task, "retry_discovery", 2048, NULL, 3, NULL);
     }
 }
 
@@ -241,6 +259,9 @@ void bluetooth_init(void) {
         return;
     }
     
+    // Configure ESP-IDF Bluetooth stack logging
+    configure_esp_bt_logging();
+    
     // Log free heap before SPP init
     LOG_DEBUG(TAG, "Free heap before SPP: %lu bytes", esp_get_free_heap_size());
     
@@ -269,4 +290,50 @@ void bluetooth_init(void) {
     }
     
     LOG_INFO(TAG, "Bluetooth initialization complete!");
+    
+    // Start the global reconnection watchdog
+    xTaskCreate(reconnection_watchdog_task, "bt_watchdog", 2048, NULL, 2, NULL);
+} 
+
+// Task to restart discovery after a delay (infinite reconnection)
+void restart_discovery_task(void *pvParameters) {
+    vTaskDelay(pdMS_TO_TICKS(5000));  // Wait 5 seconds
+    
+    // Only restart if still disconnected
+    if (!is_connected && !is_connecting) {
+        ESP_LOGI(TAG, "🔄 Restarting discovery after timeout...");
+        start_device_discovery();
+    } else {
+        ESP_LOGD(TAG, "🎯 Connected during delay - skipping discovery restart");
+    }
+    
+    vTaskDelete(NULL);
+} 
+
+// Task to restart discovery after a delay (infinite reconnection)
+void discovery_timeout_task(void *pvParameters) {
+    vTaskDelay(pdMS_TO_TICKS(15000));  // Wait 15 seconds max
+    
+    if (is_searching && !is_connected && !is_connecting) {
+        ESP_LOGW(TAG, "⏰ Discovery timeout - forcing restart");
+        esp_bt_gap_cancel_discovery();
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        start_device_discovery();
+    }
+    
+    vTaskDelete(NULL);
+} 
+
+// Global reconnection watchdog - ensures we NEVER stop trying to reconnect
+void reconnection_watchdog_task(void *pvParameters) {
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(30000));  // Check every 30 seconds
+        
+        // If disconnected and not actively trying to reconnect, force reconnection
+        if (!is_connected && !is_connecting && !is_searching) {
+            ESP_LOGW(TAG, "🚨 Reconnection watchdog triggered - forcing reconnection attempt");
+            connection_attempt = 0;  // Reset retry counter
+            handle_connection_failure();
+        }
+    }
 } 
