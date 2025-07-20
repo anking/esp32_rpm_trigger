@@ -116,7 +116,7 @@ static void spp_callback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param) {
             if (param) {
                 spp_handle = param->open.handle;
             }
-            led_set_connected(true);  // Turn on LED solid
+            // LED control is now automatic via bluetooth_led_task
             
             // Create task for delayed ELM327 initialization to prevent immediate disconnection
             LOG_VERBOSE(TAG, "Scheduling ELM327 initialization...");
@@ -128,8 +128,8 @@ static void spp_callback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param) {
             is_connecting = false;   // Reset connection attempt state
             is_connected = false;    // No longer connected
             elm327_initialized = false;
-            ecu_connected = false;   // Reset ECU connection state
-            led_set_connected(false);  // Turn off LED
+            set_ecu_status(false);   // Update ECU status for LED control
+            // LED control is now automatic via bluetooth_led_task
             
             handle_connection_failure();
             break;
@@ -198,7 +198,7 @@ void start_device_discovery(void) {
     esp_err_t ret = esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 10, 0);
     if (ret == ESP_OK) {
         ESP_LOGI(TAG, "✅ Device discovery started successfully");
-        led_set_searching(true);  // Start LED search indicator
+        // LED search indicator handled automatically by bluetooth_led_task
         ESP_LOGI(TAG, "🔍 Device discovery started - looking for ELM327...");
         
         // Create timeout protection task - restart discovery if it takes too long

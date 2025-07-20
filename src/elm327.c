@@ -7,6 +7,7 @@
 #include "elm327.h"
 #include "bluetooth.h"
 #include "obd_data.h"
+#include "gpio_control.h"
 
 static const char *TAG = "ELM327";
 
@@ -508,8 +509,8 @@ void initialize_elm327(void) {
     // Mark as initialized
     elm327_initialized = true;
     elm_ready = true;  // Ready to accept commands
-    initialization_in_progress = false;  // Initialization complete
-    ESP_LOGI(TAG, "✅ === ELM327 INITIALIZATION SEQUENCE COMPLETE ===");
+    set_ecu_status(true);  // Update ECU status for LED control
+    LOG_INFO(TAG, "ELM327 initialization complete - diagnostics above show readiness!");
     
     // Signal that ELM327 is ready
     xSemaphoreGive(connection_semaphore);

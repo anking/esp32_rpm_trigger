@@ -30,37 +30,49 @@ void app_main(void) {
     
     // Configure ESP-IDF logging levels (suppress noisy BT stack logs)
     configure_esp_bt_logging();
+    LOG_INFO(TAG, "Logging configured");
     
     // Initialize all modules
-    LOG_VERBOSE(TAG, "Initializing system modules...");
+    LOG_INFO(TAG, "Initializing system modules...");
     
     // Initialize GPIO and LED system
+    LOG_INFO(TAG, "Initializing GPIO...");
     gpio_init_system();
+    LOG_INFO(TAG, "GPIO initialized");
     
     // Initialize ELM327 system (semaphores, buffers)
+    LOG_INFO(TAG, "Initializing ELM327...");
     elm327_init_system();
+    LOG_INFO(TAG, "ELM327 initialized");
     
     // Initialize OBD data system
+    LOG_INFO(TAG, "Initializing OBD data...");
     obd_data_init();
+    LOG_INFO(TAG, "OBD data initialized");
     
     // Initialize Bluetooth system
+    LOG_INFO(TAG, "Initializing Bluetooth...");
     bluetooth_init();
+    LOG_INFO(TAG, "Bluetooth initialized");
+    
+    // Create Bluetooth LED indicator task (after bluetooth init)
+    LOG_INFO(TAG, "Creating Bluetooth LED task...");
+    xTaskCreate(bluetooth_led_task, "bt_led", 2048, NULL, 4, NULL);
+    LOG_INFO(TAG, "Bluetooth LED task created");
     
     // Log target ELM327 device
     LOG_INFO(TAG, "Looking for ELM327 device: [01:23:45:67:89:BA]");
     
     // Start device discovery immediately
-    LOG_VERBOSE(TAG, "Starting device search...");
+    LOG_INFO(TAG, "Starting device search...");
     vTaskDelay(pdMS_TO_TICKS(100));  // Brief delay for system stability
     start_device_discovery();
-    
-    // Create LED search indicator task
-    LOG_VERBOSE(TAG, "Creating LED search task...");
-    xTaskCreate(led_search_task, "led_search", 2048, NULL, 4, NULL);
+    LOG_INFO(TAG, "Device search started");
     
     // Create OBD data polling task
-    LOG_VERBOSE(TAG, "Creating OBD task...");
+    LOG_INFO(TAG, "Creating OBD task...");
     xTaskCreate(obd_task, "obd_task", 4096, NULL, 5, NULL);
+    LOG_INFO(TAG, "OBD task created");
     
     LOG_INFO(TAG, "System initialization complete. Searching for ELM327...");
     

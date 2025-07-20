@@ -545,12 +545,12 @@ void display_vehicle_data(void) {
              vehicle_data.vehicle_speed);
 }
 
-// Log vehicle status with GPIO state
+// Log vehicle status
 void log_vehicle_status(void) {
-    const char* gpio_state = gpio_status ? "ON" : "OFF";
-    ESP_LOGI(TAG, "RPM: %lu | Throttle: %d%% | Speed: %d km/h | GPIO2: %s",
+    ESP_LOGI(TAG, "RPM: %lu | Throttle: %d%% | Speed: %d km/h",
              vehicle_data.rpm,
              vehicle_data.throttle_position,
-             vehicle_data.vehicle_speed,
-             gpio_state);
-} 
+             vehicle_data.vehicle_speed);
+}
+
+ 
