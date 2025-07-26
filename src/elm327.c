@@ -62,12 +62,12 @@ void elm327_init_system(void) {
 // ELM327 specific command sending with error handling
 esp_err_t elm327_send_command_with_options(const char *cmd, bool wait_for_prompt) {
     if (!is_connected || tx_char_handle == 0) {
-        ESP_LOGW(TAG, "⚠️ Not connected to ELM327");
+        LOG_WARN(TAG, "⚠️ Not connected to ELM327");
         return ESP_ERR_INVALID_STATE;
     }
     
-    // Always log outgoing commands
-    ESP_LOGI(TAG, "⬆️ SEND: %s", cmd);
+    // Command logging should respect ELM327 logging flag
+    LOG_ELM(TAG, "⬆️ SEND: %s", cmd);
     
     // Wait for ELM327 to be ready (prompt detected) with timeout - only if requested
     if (wait_for_prompt) {
@@ -80,16 +80,16 @@ esp_err_t elm327_send_command_with_options(const char *cmd, bool wait_for_prompt
             // Check for timeout to prevent watchdog issues
             if ((xTaskGetTickCount() - start_time) > timeout) {
                 if (initialization_in_progress) {
-                    ESP_LOGD(TAG, "🔧 ELM327 busy during initialization, proceeding with send");
+                    LOG_DEBUG(TAG, "🔧 ELM327 busy during initialization, proceeding with send");
                 } else {
-                    ESP_LOGW(TAG, "⚠️ Timeout waiting for prompt, proceeding with send");
+                    LOG_WARN(TAG, "⚠️ Timeout waiting for prompt, proceeding with send");
                 }
                 break;
             }
         }
         elm_ready = false;  // Clear flag before sending
     } else {
-        ESP_LOGD(TAG, "Skipping prompt wait for ECU test command");
+        LOG_DEBUG(TAG, "Skipping prompt wait for ECU test command");
     }
     
     char formatted_cmd[32];
@@ -97,7 +97,7 @@ esp_err_t elm327_send_command_with_options(const char *cmd, bool wait_for_prompt
     
     esp_err_t ret = ble_uart_write((uint8_t *)formatted_cmd, len);
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "⚠️ Failed to send '%s': %s", cmd, esp_err_to_name(ret));
+        LOG_WARN(TAG, "⚠️ Failed to send '%s': %s", cmd, esp_err_to_name(ret));
     }
     
     return ret;
@@ -114,84 +114,73 @@ void elm327_handle_response(const char *response) {
         return;
     }
     
-    ESP_LOGI(TAG, "⬇️ RECV: %s", response);
+    // Response logging should respect ELM327 logging flag
+    LOG_ELM(TAG, "⬇️ RECV: %s", response);
     
     // Always set the response received flag first
     response_received_flag = true;
     
     // Check for common ELM327 responses
     if (strstr(response, "ELM327")) {
-        ESP_LOGI(TAG, "🎉 VEEPEAK ELM327 device identified: %s", response);
+        LOG_INFO(TAG, "🎉 VEEPEAK ELM327 device identified: %s", response);
         LOG_INFO(TAG, "🚀 SUCCESS! VEEPEAK firmware handshake complete - device is responsive!");
         if (strstr(response, "v2.")) {
             LOG_INFO(TAG, "📋 Detected VEEPEAK ELM327 version 2.x - fully compatible");
         }
     } else if (strstr(response, "OK")) {
-        ESP_LOGD(TAG, "✅ Command acknowledged");
+        LOG_DEBUG(TAG, "✅ Command acknowledged");
     } else if (strcmp(response, "?") == 0) {
-        ESP_LOGI(TAG, "❓ VEEPEAK prompt/error response - device is responding to trigger");
-        LOG_INFO(TAG, "🔧 This '?' response indicates VEEPEAK processed the trigger command");
+        LOG_DEBUG(TAG, "❓ VEEPEAK prompt/error response - device is responding to trigger");
+        LOG_DEBUG(TAG, "🔧 This '?' response indicates VEEPEAK processed the trigger command");
     } else if (strstr(response, "CAN ERROR") || strstr(response, "NO DATA")) {
-        ESP_LOGW(TAG, "⚠️ CAN/ECU error: %s", response);
+        LOG_WARN(TAG, "⚠️ CAN/ECU error: %s", response);
         
         // Track ECU disconnection patterns
         consecutive_ecu_failures++;
         can_error_count++;
         
         if (++consecutive_fail >= 3) {
-            ESP_LOGW(TAG, "⚠️ 3 consecutive failures, backing off...");
+            LOG_WARN(TAG, "⚠️ 3 consecutive failures, backing off...");
             consecutive_fail = 0;
-            // Slow-down: pause for 300ms
             vTaskDelay(pdMS_TO_TICKS(300));
         }
         
-        // Check for ECU disconnection
         check_ecu_disconnection();
         return;
     } else if (strstr(response, "ERROR")) {
-        ESP_LOGW(TAG, "⚠️ ELM327 error: %s", response);
+        LOG_WARN(TAG, "⚠️ ELM327 error: %s", response);
         consecutive_ecu_failures++;
         check_ecu_disconnection();
     } else if (strstr(response, "UNABLE TO CONNECT")) {
-        ESP_LOGD(TAG, "🔌 ELM327 cannot connect to ECU");
-        
-        // Track unable to connect failures
+        LOG_DEBUG(TAG, "🔌 ELM327 cannot connect to ECU");
         consecutive_ecu_failures++;
         unable_to_connect_count++;
-        
-        // Check for ECU disconnection
         check_ecu_disconnection();
     } else if (strstr(response, "SEARCHING")) {
-        ESP_LOGD(TAG, "🔍 ELM327 searching for ECU...");
-        // FIXED: Improved SEARCHING handling with retry logic
+        LOG_DEBUG(TAG, "🔍 ELM327 searching for ECU...");
         LOG_WARN(TAG, "⚠️ ECU searching - no ECU response yet");
         consecutive_ecu_failures++;
         
-        // If we've been searching too long, retry the command
         static int search_retry_count = 0;
         search_retry_count++;
         if (search_retry_count >= 3) {
             LOG_WARN(TAG, "🔄 Retrying ECU command after multiple SEARCHING responses...");
             search_retry_count = 0;
-            vTaskDelay(pdMS_TO_TICKS(2000)); // Wait 2 seconds
+            vTaskDelay(pdMS_TO_TICKS(2000));
             
-            // Retry basic ECU test command
             esp_err_t ret = elm327_send_command("0100");
             if (ret != ESP_OK) {
                 LOG_ERROR(TAG, "❌ Failed to retry ECU command: %s", esp_err_to_name(ret));
             }
         }
     } else {
-        // Successfully received some response - reset basic failure counter
         consecutive_fail = 0;
         
-        // Check if this is a valid ECU test response (Mode 1, PID 00)
         if (strstr(response, "41 00") != NULL) {
             ecu_test_response_received = true;
-            ESP_LOGD(TAG, "🎯 ECU test response detected: %s", response);
+            LOG_DEBUG(TAG, "🎯 ECU test response detected: %s", response);
         }
         
-        // Process as potential OBD data
         process_obd_response(response);
     }
 }
@@ -224,58 +213,47 @@ void process_received_data(const char *data, uint16_t len) {
         return;
     }
     
-    // Debug: Log raw received data
-    ESP_LOGD(TAG, "Raw data received (%d bytes): %.*s", len, len, data);
+    LOG_DEBUG(TAG, "Raw data received (%d bytes): %.*s", len, len, data);
     
     // Add received data to buffer
     for (uint16_t i = 0; i < len && rx_buffer_len < (RX_BUFFER_SIZE - 1); i++) {
         char c = data[i];
         
-        // Check for end of response (carriage return)
         if (c == '\r') {
             if (rx_buffer_len > 0) {
-                rx_buffer[rx_buffer_len] = '\0';  // Null terminate
-                
-                ESP_LOGD(TAG, "Processing response (len=%d): '%s'", rx_buffer_len, rx_buffer);
+                rx_buffer[rx_buffer_len] = '\0';
+                LOG_DEBUG(TAG, "Processing response (len=%d): '%s'", rx_buffer_len, rx_buffer);
                 elm327_handle_response(rx_buffer);
-                
-                // Clear buffer for next response
                 rx_buffer_len = 0;
                 memset(rx_buffer, 0, RX_BUFFER_SIZE);
             }
         } else if (c == '\n') {
-            // Ignore line feed (often follows carriage return) - prevents duplicate processing
-            ESP_LOGD(TAG, "Ignoring LF character");
+            LOG_DEBUG(TAG, "Ignoring LF character");
             continue;
         } else if (c == '>') {
-            // Prompt detected - ELM327 is ready for next command
             elm_ready = true;
-            ESP_LOGD(TAG, "🔥 Prompt '>' detected, elm_ready=true");
+            LOG_DEBUG(TAG, "🔥 Prompt '>' detected, elm_ready=true");
             
-            // Process any buffered data up to the prompt (handles ?\r\r> pattern from nRF Connect)
             if (rx_buffer_len > 0) {
                 rx_buffer[rx_buffer_len] = '\0';
-                ESP_LOGD(TAG, "Processing prompt response: '%s'", rx_buffer);
+                LOG_DEBUG(TAG, "Processing prompt response: '%s'", rx_buffer);
                 elm327_handle_response(rx_buffer);
                 rx_buffer_len = 0;
                 memset(rx_buffer, 0, RX_BUFFER_SIZE);
             }
             
-            // Set response flag for prompt detection (critical for initialization task)
             response_received_flag = true;
-            ESP_LOGD(TAG, "🔥 response_received_flag set to true (prompt detected)");
-        } else if (c >= 32 && c <= 126) {  // Printable ASCII characters
+            LOG_DEBUG(TAG, "🔥 response_received_flag set to true (prompt detected)");
+        } else if (c >= 32 && c <= 126) {
             rx_buffer[rx_buffer_len++] = c;
         } else {
-            // Log any unexpected characters
-            ESP_LOGD(TAG, "Unexpected char: 0x%02X (%d)", c, c);
+            LOG_DEBUG(TAG, "Unexpected char: 0x%02X (%d)", c, c);
         }
     }
     
-    // Set flag if any valid data was processed (ensures initialization task detects responses)
     if (rx_buffer_len > 0 || strstr(data, ">") != NULL) {
         response_received_flag = true;
-        ESP_LOGD(TAG, "🔥 response_received_flag set to true (data processed)");
+        LOG_DEBUG(TAG, "🔥 response_received_flag set to true (data processed)");
     }
 }
 
@@ -283,61 +261,48 @@ void process_received_data(const char *data, uint16_t len) {
 bool test_ecu_connectivity(void) {
     // Check prerequisites
     if (!is_connected) {
-        ESP_LOGD(TAG, "❌ Bluetooth not connected - cannot test ECU");
+        LOG_DEBUG(TAG, "❌ Bluetooth not connected - cannot test ECU");
         return false;
     }
     
     if (!elm327_initialized) {
-        ESP_LOGD(TAG, "❌ ELM327 not initialized - cannot test ECU");
+        LOG_DEBUG(TAG, "❌ ELM327 not initialized - cannot test ECU");
         return false;
     }
     
-    ESP_LOGI(TAG, "🔍 Testing ECU connectivity...");
+    LOG_INFO(TAG, "🔍 Testing ECU connectivity...");
     
     // Clear any pending response flags and buffer
     elm_ready = false;
-    ecu_test_response_received = false;  // Clear ECU test flag
+    ecu_test_response_received = false;
     memset(rx_buffer, 0, RX_BUFFER_SIZE);
     rx_buffer_len = 0;
     
-    // Send basic OBD test command (get supported PIDs) - skip prompt wait for ECU testing
     esp_err_t ret = elm327_send_command_with_options("0100", false);
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "❌ Failed to send ECU test command");
+        LOG_WARN(TAG, "❌ Failed to send ECU test command");
         return false;
     }
     
-    // Wait for response with timeout
     TickType_t start_time = xTaskGetTickCount();
-    TickType_t timeout = pdMS_TO_TICKS(4000);  // 4 second timeout (longer for first connection)
+    TickType_t timeout = pdMS_TO_TICKS(4000);
     
     while ((xTaskGetTickCount() - start_time) < timeout) {
-        vTaskDelay(pdMS_TO_TICKS(50));  // Check every 50ms
+        vTaskDelay(pdMS_TO_TICKS(50));
         
-        // Check if we got a valid ECU test response (flag set by elm327_handle_response)
         if (ecu_test_response_received) {
-            ESP_LOGI(TAG, "✅ ECU connection verified! Supported PIDs detected");
+            LOG_INFO(TAG, "✅ ECU connection verified! Supported PIDs detected");
             return true;
         }
         
-        // Check for error responses in buffer
         if (rx_buffer_len > 5) {
-            // Check for error responses
-            if (strstr(rx_buffer, "UNABLE TO CONNECT") != NULL) {
+            if (strstr(rx_buffer, "UNABLE TO CONNECT") != NULL ||
+                strstr(rx_buffer, "CAN ERROR") != NULL ||
+                strstr(rx_buffer, "NO DATA") != NULL) {
                 return false;
             }
             
-            if (strstr(rx_buffer, "CAN ERROR") != NULL) {
-                return false;
-            }
-            
-            if (strstr(rx_buffer, "NO DATA") != NULL) {
-                return false;
-            }
-            
-            // If we got "SEARCHING..." continue waiting
             if (strstr(rx_buffer, "SEARCHING") != NULL) {
-                // Clear buffer and continue waiting
                 memset(rx_buffer, 0, RX_BUFFER_SIZE);
                 rx_buffer_len = 0;
                 continue;
@@ -345,54 +310,46 @@ bool test_ecu_connectivity(void) {
         }
     }
     
-    ESP_LOGD(TAG, "❌ ECU test timeout - no valid response received");
+    LOG_DEBUG(TAG, "❌ ECU test timeout - no valid response received");
     return false;
 }
 
 // Verify ECU connection with retries
 void verify_ecu_connection(void) {
-    ESP_LOGI(TAG, "🔗 === ECU CONNECTION VERIFICATION START ===");
-    ESP_LOGI(TAG, "📡 Testing connection to vehicle ECU...");
+    LOG_INFO(TAG, "🔗 === ECU CONNECTION VERIFICATION START ===");
+    LOG_INFO(TAG, "📡 Testing connection to vehicle ECU...");
     
     ecu_connected = false;
     int attempt = 1;
     
     while (!ecu_connected) {
-        // Check if Bluetooth is still connected
         if (!is_connected) {
-            ESP_LOGW(TAG, "🔴 Bluetooth disconnected during ECU verification - stopping");
+            LOG_WARN(TAG, "🔴 Bluetooth disconnected during ECU verification - stopping");
             ecu_connected = false;
             return;
         }
         
-        // Check if ELM327 is still initialized
         if (!elm327_initialized) {
-            ESP_LOGW(TAG, "🔴 ELM327 no longer initialized - stopping ECU verification");
+            LOG_WARN(TAG, "🔴 ELM327 no longer initialized - stopping ECU verification");
             ecu_connected = false;
             return;
         }
         
-        ESP_LOGI(TAG, "🔄 ECU Connection Attempt #%d", attempt);
+        LOG_INFO(TAG, "🔄 ECU Connection Attempt #%d", attempt);
         
         if (test_ecu_connectivity()) {
             ecu_connected = true;
-            ESP_LOGI(TAG, "✅ === ECU CONNECTION ESTABLISHED ===");
-            ESP_LOGI(TAG, "🚗 Vehicle ECU is responding to OBD commands");
-            ESP_LOGI(TAG, "🎯 System ready for OBD data polling!");
+            LOG_INFO(TAG, "✅ === ECU CONNECTION ESTABLISHED ===");
+            LOG_INFO(TAG, "🚗 Vehicle ECU is responding to OBD commands");
+            LOG_INFO(TAG, "🎯 System ready for OBD data polling!");
             break;
         }
         
-        ESP_LOGD(TAG, "⏱️ ECU not ready, retrying in 2 seconds...");
-        ESP_LOGD(TAG, "💡 Ensure: 1) Ignition ON  2) Engine running  3) OBD cable secure");
+        LOG_DEBUG(TAG, "⏱️ ECU not ready, retrying in 2 seconds...");
+        LOG_DEBUG(TAG, "💡 Ensure: 1) Ignition ON  2) Engine running  3) OBD cable secure");
         
-        vTaskDelay(pdMS_TO_TICKS(2000));  // Wait 2 seconds before retry
+        vTaskDelay(pdMS_TO_TICKS(2000));
         attempt++;
-        
-        // Optional: Add max attempts if desired
-        // if (attempt > 30) { // 1 minute of attempts
-        //     ESP_LOGE(TAG, "❌ ECU connection failed after 30 attempts");
-        //     break;
-        // }
     }
 }
 
@@ -414,10 +371,10 @@ void check_ecu_disconnection(void) {
         unable_to_connect_count >= MAX_UNABLE_TO_CONNECT ||
         can_error_count >= MAX_CAN_ERRORS) {
         
-        ESP_LOGW(TAG, "🔴 ECU DISCONNECTION DETECTED!");
-        ESP_LOGW(TAG, "├─ Consecutive failures: %d/%d", consecutive_ecu_failures, MAX_CONSECUTIVE_FAILURES);
-        ESP_LOGW(TAG, "├─ Unable to connect: %d/%d", unable_to_connect_count, MAX_UNABLE_TO_CONNECT);
-        ESP_LOGW(TAG, "├─ CAN errors: %d/%d", can_error_count, MAX_CAN_ERRORS);
+        LOG_WARN(TAG, "🔴 ECU DISCONNECTION DETECTED!");
+        LOG_WARN(TAG, "├─ Consecutive failures: %d/%d", consecutive_ecu_failures, MAX_CONSECUTIVE_FAILURES);
+        LOG_WARN(TAG, "├─ Unable to connect: %d/%d", unable_to_connect_count, MAX_UNABLE_TO_CONNECT);
+        LOG_WARN(TAG, "├─ CAN errors: %d/%d", can_error_count, MAX_CAN_ERRORS);
         
         reset_ecu_connection();
     }
@@ -425,38 +382,29 @@ void check_ecu_disconnection(void) {
 
 // Reset ECU connection and start reconnection process
 void reset_ecu_connection(void) {
-    ESP_LOGW(TAG, "🔄 Resetting ECU connection - will attempt reconnection");
+    LOG_WARN(TAG, "🔄 Resetting ECU connection - will attempt reconnection");
     
-    // Reset connection state
     ecu_connected = false;
-    
-    // Reset error counters
     consecutive_ecu_failures = 0;
     unable_to_connect_count = 0;
     can_error_count = 0;
     
-    ESP_LOGI(TAG, "🔗 Starting ECU reconnection process...");
+    LOG_INFO(TAG, "🔗 Starting ECU reconnection process...");
     
-    // Start verification in separate task to avoid blocking
-    // FIXED: Increased stack size from 4096 to 6144 for ELM327 operations
     xTaskCreate(ecu_reconnection_task, "ecu_reconnect", 6144, NULL, 5, NULL);
 }
 
-// ECU reconnection task (runs in separate thread)
+// ECU reconnection task
 void ecu_reconnection_task(void *pv) {
-    ESP_LOGI(TAG, "ECU reconnection task started...");
+    LOG_INFO(TAG, "ECU reconnection task started...");
     
-    // Check if Bluetooth is still connected before attempting reconnection
     if (!is_connected) {
-        ESP_LOGW(TAG, "🔴 Bluetooth disconnected - aborting ECU reconnection");
+        LOG_WARN(TAG, "🔴 Bluetooth disconnected - aborting ECU reconnection");
         vTaskDelete(NULL);
         return;
     }
     
-    // Perform ECU connection verification
     verify_ecu_connection();
-    
-    // Delete this task when done
     vTaskDelete(NULL);
 }
 
@@ -468,129 +416,69 @@ void reset_ecu_error_counters(void) {
     if (can_error_count > 0) can_error_count--;
 }
 
-// Gentle ELM327 initialization to prevent disconnection
+// Gentle ELM327 initialization
 void initialize_elm327(void) {
-    // Mark initialization as in progress
     initialization_in_progress = true;
     
-    ESP_LOGI(TAG, "🚀 === ELM327 INITIALIZATION SEQUENCE START ===");
-    ESP_LOGI(TAG, "🔧 Configuring ELM327 for universal vehicle compatibility (Auto-detect protocol)");
+    connection_semaphore = xSemaphoreCreateBinary();
+    if (connection_semaphore == NULL) {
+        LOG_ERROR(TAG, "❌ Failed to create connection semaphore");
+        initialization_in_progress = false;
+        return;
+    }
     
-    // Wait for ELM327 to settle after connection
-    ESP_LOGI(TAG, "⏱️ Step 1: Waiting 3 seconds for ELM327 to settle...");
+    memset(rx_buffer, 0, RX_BUFFER_SIZE);
+    rx_buffer_len = 0;
+    
     vTaskDelay(pdMS_TO_TICKS(3000));
     
-    // Send reset command
-    ESP_LOGI(TAG, "🔄 Step 2: Sending reset command...");
     esp_err_t ret = elm327_send_command("ATZ");
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "❌ Failed to send ATZ");
-        initialization_in_progress = false;  // Clear flag on failure
+        LOG_ERROR(TAG, "❌ Failed to send ATZ");
+        initialization_in_progress = false;
         return;
     }
     
-    // Wait for reset to complete
-    ESP_LOGI(TAG, "⏱️ Step 3: Waiting for reset to complete...");
     vTaskDelay(pdMS_TO_TICKS(3000));
     
-    // Configure ELM327 with universal settings (auto-detect protocol)
-    ESP_LOGI(TAG, "⚙️ Step 4: Configuring ELM327 parameters...");
-    
-    // Turn off echo
-    ESP_LOGI(TAG, "├─ Disabling echo...");
     ret = elm327_send_command("ATE0");
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "❌ Failed to send ATE0");
-        initialization_in_progress = false;  // Clear flag on failure
+        LOG_ERROR(TAG, "❌ Failed to send ATE0");
+        initialization_in_progress = false;
         return;
     }
     vTaskDelay(pdMS_TO_TICKS(500));
     
-    // Try automatic protocol detection first (works with most vehicles)
-    ESP_LOGI(TAG, "├─ Setting auto protocol detection...");
-    elm327_send_command("AT SP 0");
-    vTaskDelay(pdMS_TO_TICKS(500));
+    // Send initialization commands
+    const char *init_cmds[] = {
+        "AT SP 0", "AT CRA", "AT AL", "AT SH 7DF", "AT CAF1",
+        "AT ST 32", "ATH0", "AT RV", "AT DPN", "0100"
+    };
     
-    // Reset all filters to ensure clean communication
-    ESP_LOGI(TAG, "├─ Resetting all filters...");
-    elm327_send_command("AT CRA");
-    vTaskDelay(pdMS_TO_TICKS(500));
+    for (size_t i = 0; i < sizeof(init_cmds)/sizeof(init_cmds[0]); i++) {
+        elm327_send_command(init_cmds[i]);
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
     
-    // Allow long frames (>7 bytes)
-    ESP_LOGI(TAG, "├─ Enabling long frames...");
-    elm327_send_command("AT AL");
-    vTaskDelay(pdMS_TO_TICKS(500));
-    
-    // Try broadcast first (more compatible)
-    ESP_LOGI(TAG, "├─ Setting broadcast address...");
-    elm327_send_command("AT SH 7DF");
-    vTaskDelay(pdMS_TO_TICKS(500));
-    
-    // Enable ELM auto-formatting for ISO-TP
-    ESP_LOGI(TAG, "├─ Enabling auto-format ISO-TP...");
-    elm327_send_command("AT CAF1");
-    vTaskDelay(pdMS_TO_TICKS(500));
-    
-    // Set shorter timeout (50ms instead of 100ms default)
-    ESP_LOGI(TAG, "├─ Setting shorter timeout...");
-    elm327_send_command("AT ST 32");
-    vTaskDelay(pdMS_TO_TICKS(500));
-    
-    // Headers off for shorter replies
-    ESP_LOGI(TAG, "├─ Disabling headers...");
-    elm327_send_command("ATH0");
-    vTaskDelay(pdMS_TO_TICKS(500));
-    
-    // Test basic connectivity with a simple command
-    ESP_LOGI(TAG, "├─ Testing basic connectivity...");
-    elm327_send_command("AT RV");
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    
-    // Check what protocol was detected
-    ESP_LOGI(TAG, "├─ Checking detected protocol...");
-    elm327_send_command("AT DPN");
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    
-    // Try a basic OBD test
-    ESP_LOGI(TAG, "├─ Testing basic OBD...");
-    elm327_send_command("0100");
-    vTaskDelay(pdMS_TO_TICKS(4000));  // Longer wait for first OBD command
-    
-    // If no response, try specific protocols for different vehicles
-    ESP_LOGI(TAG, "├─ Testing protocol-specific configurations...");
-    
-    // Try ISO 15765-4 CAN (11 bit ID, 500 kbaud) - common for Audi/VW
-    ESP_LOGI(TAG, "├─ Trying Audi/VW protocol (ISO 15765-4, 11-bit)...");
+    // Try specific protocols
     elm327_send_command("AT SP 6");
     vTaskDelay(pdMS_TO_TICKS(500));
     elm327_send_command("0100");
     vTaskDelay(pdMS_TO_TICKS(3000));
     
-    // Try ISO 15765-4 CAN (29 bit ID, 500 kbaud) - alternative for some Audis
-    ESP_LOGI(TAG, "├─ Trying alternative CAN protocol (29-bit)...");
     elm327_send_command("AT SP 7");
     vTaskDelay(pdMS_TO_TICKS(500));
     elm327_send_command("0100");
     vTaskDelay(pdMS_TO_TICKS(3000));
     
-    // Reset back to auto-detect for normal operation
-    ESP_LOGI(TAG, "├─ Resetting to auto-detect for normal operation...");
     elm327_send_command("AT SP 0");
     vTaskDelay(pdMS_TO_TICKS(500));
     
-    ESP_LOGI(TAG, "If above shows CAN ERROR or NO DATA, check:");
-    ESP_LOGI(TAG, "1. Car ignition is ON");
-    ESP_LOGI(TAG, "2. Car engine is running"); 
-    ESP_LOGI(TAG, "3. OBD port connection is secure");
-    ESP_LOGI(TAG, "4. Vehicle is OBD-II compliant (1996+ for US, 2001+ for EU)");
-    
-    // Mark as initialized
     elm327_initialized = true;
-    elm_ready = true;  // Ready to accept commands
-    set_ecu_status(true);  // Update ECU status for LED control
+    elm_ready = true;
+    set_ecu_status(true);
     LOG_INFO(TAG, "ELM327 initialization complete - diagnostics above show readiness!");
     
-    // FIXED: Signal that ELM327 is ready (with NULL check)
     if (connection_semaphore != NULL) {
         LOG_INFO(TAG, "📡 Giving semaphore %p - ELM327 ready", connection_semaphore);
         xSemaphoreGive(connection_semaphore);
@@ -598,7 +486,6 @@ void initialize_elm327(void) {
         LOG_WARN(TAG, "⚠️ Skipping semaphore give - connection_semaphore not initialized (test mode?)");
     }
     
-    // Now verify connection to vehicle ECU
     verify_ecu_connection();
 }
 

@@ -77,24 +77,20 @@ static void gap_callback(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *p
             esp_ble_gap_cb_param_t *scan_result = (esp_ble_gap_cb_param_t *)param;
             
             if (scan_result->scan_rst.search_evt == ESP_GAP_SEARCH_INQ_RES_EVT) {
-                char addr_str[18];
-                snprintf(addr_str, sizeof(addr_str), "%02X:%02X:%02X:%02X:%02X:%02X",
-                        scan_result->scan_rst.bda[0], scan_result->scan_rst.bda[1], 
-                        scan_result->scan_rst.bda[2], scan_result->scan_rst.bda[3],
-                        scan_result->scan_rst.bda[4], scan_result->scan_rst.bda[5]);
-                
-                // Log ALL discovered BLE devices for debugging
-                LOG_INFO(TAG, "📱 BLE Device Found: %s (RSSI: %d, AddrType: %d)", 
-                        addr_str, scan_result->scan_rst.rssi, scan_result->scan_rst.ble_addr_type);
-                
-                // Check if this is our target ELM327 device
+                // Only log target device to reduce noise
                 if (bd_addr_equal(scan_result->scan_rst.bda, target_elm327_addr)) {
+                    char addr_str[18];
+                    snprintf(addr_str, sizeof(addr_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+                            scan_result->scan_rst.bda[0], scan_result->scan_rst.bda[1], 
+                            scan_result->scan_rst.bda[2], scan_result->scan_rst.bda[3],
+                            scan_result->scan_rst.bda[4], scan_result->scan_rst.bda[5]);
+                    
                     if (is_connecting || connect_pending) {
-                        ESP_LOGD(TAG, "🎯 Already connecting/pending to ELM327, ignoring duplicate");
+                        LOG_DEBUG(TAG, "🎯 Already connecting/pending to ELM327, ignoring duplicate");
                         return;
                     }
                     
-                    LOG_INFO(TAG, "🎯 MATCH! This is our target VEEPEAK ELM327: %s", addr_str);
+                    LOG_INFO(TAG, "🎯 MATCH! Found target VEEPEAK ELM327: %s", addr_str);
                     LOG_INFO(TAG, "📍 Device address type: %d, RSSI: %d", scan_result->scan_rst.ble_addr_type, scan_result->scan_rst.rssi);
                     
                     // Store connection info for later (after scan stops)
@@ -102,10 +98,8 @@ static void gap_callback(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *p
                     pending_addr_type = scan_result->scan_rst.ble_addr_type;
                     connect_pending = true;
                     
-                    LOG_INFO(TAG, "🛑 Stopping scan first, then will connect...");
+                    LOG_INFO(TAG, "🛑 Stopping scan to connect...");
                     esp_ble_gap_stop_scanning();  // Connection will happen in SCAN_STOP_COMPLETE_EVT
-                } else {
-                    // We already logged this device above, no need to log again
                 }
             }
             break;
@@ -137,8 +131,7 @@ static void gap_callback(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *p
                         pending_bda[0], pending_bda[1], pending_bda[2], 
                         pending_bda[3], pending_bda[4], pending_bda[5]);
                 
-                LOG_INFO(TAG, "🔗 Scan fully stopped - now connecting to VEEPEAK: %s", addr_str);
-                LOG_INFO(TAG, "📍 Using address type: %d (direct connection)", pending_addr_type);
+                LOG_INFO(TAG, "🔗 Initiating connection to VEEPEAK: %s", addr_str);
                 
                 // Clear white list before connecting
                 esp_ble_gap_clear_whitelist();
@@ -148,245 +141,133 @@ static void gap_callback(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *p
                 if (ret != ESP_OK) {
                     LOG_ERROR(TAG, "❌ Connection failed: %s", esp_err_to_name(ret));
                     is_connecting = false;
-                } else {
-                    LOG_INFO(TAG, "✅ BLE connection request sent - waiting for CONNECT_EVT...");
-                    LOG_INFO(TAG, "⏰ Will timeout after 8 seconds if no response");
+                    // Restart scan if connection fails
+                    xTaskCreate(restart_scan_task, "restart_scan", 2048, NULL, 3, NULL);
                 }
             } else if (!is_connecting && !is_connected) {
                 // Scan completed but device not found - restart scan
-                ESP_LOGW(TAG, "🔄 ELM327 not found during scan - will retry in 5 seconds");
+                LOG_WARN(TAG, "🔄 ELM327 not found during scan - will retry in 5 seconds");
                 xTaskCreate(restart_scan_task, "restart_scan", 2048, NULL, 3, NULL);
             }
             break;
             
         default:
-            ESP_LOGD(TAG, "GAP BLE event: %d", event);
+            LOG_DEBUG(TAG, "GAP BLE event: %d", event);
             break;
     }
 }
 
 // GATT client callback for connection and service discovery
 static void gattc_callback(esp_gattc_cb_event_t event, esp_gatt_if_t gatt_if, esp_ble_gattc_cb_param_t *param) {
-    // Simplified event logging to reduce stack usage
-    if (event == ESP_GATTC_CONNECT_EVT || event == ESP_GATTC_DISCONNECT_EVT || 
-        event == ESP_GATTC_NOTIFY_EVT || event == ESP_GATTC_SEARCH_CMPL_EVT) {
-        LOG_INFO(TAG, "🔧 GATT Event: %d", event);
-    }
-    
     switch (event) {
         case ESP_GATTC_REG_EVT:
-            LOG_BT(TAG, "GATT client registered, interface: %d", gatt_if);
             gattc_if = gatt_if;
-            
-            // Start scanning for ELM327 device
             start_ble_scan();
             break;
             
-                case ESP_GATTC_CONNECT_EVT:
+        case ESP_GATTC_CONNECT_EVT:
             conn_id = param->connect.conn_id;
-            is_connecting = false;  // ✅ Clear connecting state
-            is_connected = true;    // ✅ Set connected state
-            
-            // Store peer address for register_for_notify (CRITICAL FIX)
+            is_connecting = false;
+            is_connected = true;
             memcpy(peer_bda, param->connect.remote_bda, ESP_BD_ADDR_LEN);
-            LOG_INFO(TAG, "📍 Stored peer address for notification registration");
-            
-            LOG_BT(TAG, "✅ Connected to ELM327 BLE device (conn_id: %d)", conn_id);
-            LOG_INFO(TAG, "🎉 VEEPEAK BLE connection successful!");
-            
-            // Request larger MTU for better throughput
-            esp_err_t mtu_ret = esp_ble_gattc_send_mtu_req(gattc_if, conn_id);
-            LOG_INFO(TAG, "📶 Requesting 247 byte MTU: %s", esp_err_to_name(mtu_ret));
-            
-            // Start service discovery to build attribute cache
-            LOG_INFO(TAG, "🔍 Starting service discovery to build attribute cache...");
-            esp_err_t ret = esp_ble_gattc_search_service(gattc_if, conn_id, NULL);
-            if (ret != ESP_OK) {
-                LOG_ERROR(TAG, "❌ Failed to start service discovery: %s", esp_err_to_name(ret));
-            }
+            esp_ble_gattc_send_mtu_req(gattc_if, conn_id);
+            esp_ble_gattc_search_service(gattc_if, conn_id, NULL);
             break;
             
         case ESP_GATTC_OPEN_EVT:
-            LOG_BT(TAG, "🔗 GATT OPEN event - status: %d", param->open.status);
             if (param->open.status == ESP_GATT_OK) {
-                LOG_BT(TAG, "✅ GATT connection opened successfully!");
                 conn_id = param->open.conn_id;
-                
-                // If this is the first connection event we receive (some devices send OPEN before CONNECT)
                 if (is_connecting) {
                     is_connecting = false;
                     is_connected = true;
-                    LOG_INFO(TAG, "🎉 VEEPEAK connection established via OPEN_EVT");
                 }
             } else {
-                LOG_ERROR(TAG, "❌ GATT open failed with status: %d", param->open.status);
                 is_connecting = false;
                 is_connected = false;
             }
             break;
             
         case ESP_GATTC_DISCONNECT_EVT:
-            LOG_WARN(TAG, "🔴 Disconnected from ELM327 (reason: %d)", param->disconnect.reason);
-            
-            // Check if this was a BLE protocol failure (quick disconnect after connection)
-            if (param->disconnect.reason == 0x13 || param->disconnect.reason == 0x16) {
-                LOG_ERROR(TAG, "💥 BLE protocol incompatibility detected!");
-                LOG_ERROR(TAG, "🔧 VEEPEAK may not be compatible with ESP32-S3 BLE stack");
-                LOG_ERROR(TAG, "💡 Recommendation: Use ESP32 (Classic Bluetooth) instead");
-                connection_attempt += 10; // Increase attempt count to reduce retry frequency
-            }
-            
             is_connected = false;
             is_connecting = false;
             conn_id = 0xFFFF;
-            
-            // Reset handles
             uart_service_handle = 0;
             tx_char_handle = 0;
             rx_char_handle = 0;
             rx_char_cccd_handle = 0;
-            
-            // Reset service discovery globals
             svc_start = 0;
             svc_end = 0;
-            
-            // Clear white list on disconnect to prevent "already in initiator white list" errors
-            esp_err_t clear_ret = esp_ble_gap_clear_whitelist();
-            if (clear_ret == ESP_OK) {
-                LOG_INFO(TAG, "🧹 White list cleared on disconnect");
-            }
-            
+            esp_ble_gap_clear_whitelist();
             set_ecu_status(false);
-            
-            // Play error sound for disconnection
             play_error_sound();
-            
-            // Start reconnection attempts with longer delay for compatibility issues
             if (connection_attempt > 10) {
-                LOG_WARN(TAG, "⏰ Multiple failures detected - waiting 30 seconds before retry");
                 vTaskDelay(pdMS_TO_TICKS(30000));
             }
-            
-            // FIXED: Increased stack size from 4096 to 6144 for BLE operations
             xTaskCreate(reconnection_watchdog_task, "reconnect_watchdog", 6144, NULL, 2, NULL);
             break;
             
         case ESP_GATTC_SEARCH_RES_EVT: {
-            // Check for UART service - test 128-bit Nordic UUID first, then fall back to 0xFFF0/0xFFE0
             bool is_uart_service = false;
             esp_bt_uuid_t *uuid = &param->search_res.srvc_id.uuid;
             
             if (uuid->len == ESP_UUID_LEN_128) {
-                // VEEPEAK UART Service: 0000fff0-0000-1000-8000-00805f9b34fb (CONFIRMED BY nRF CONNECT)
                 uint8_t veepeak_uuid[16] = {0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80,
                                            0x00, 0x10, 0x00, 0x00, 0xf0, 0xff, 0x00, 0x00};
                 if (memcmp(uuid->uuid.uuid128, veepeak_uuid, 16) == 0) {
                     is_uart_service = true;
-                    LOG_INFO(TAG, "🎉 Found VEEPEAK UART Service (128-bit fff0) - CORRECT UUID!");
-                }
-                // Nordic UART Service: 49535343-FE7D-4AE5-8FA9-9FAFD205E455
-                else {
-                    uint8_t nordic_uuid[16] = {0x55,0xE4,0x05,0xD2,0xAF,0x9F,0xA9,0x8F,
-                                              0xE5,0x4A,0x7D,0xFE,0x43,0x53,0x53,0x49};
-                    if (memcmp(uuid->uuid.uuid128, nordic_uuid, 16) == 0) {
-                        is_uart_service = true;
-                        LOG_INFO(TAG, "📌 Found Nordic UART Service (128-bit)");
-                    }
                 }
             } else if (uuid->len == ESP_UUID_LEN_16) {
-                // Legacy services: 0xFFF0 or 0xFFE0
-                if (uuid->uuid.uuid16 == 0xFFF0) {
+                if (uuid->uuid.uuid16 == 0xFFF0 || uuid->uuid.uuid16 == 0xFFE0) {
                     is_uart_service = true;
-                    LOG_INFO(TAG, "📌 Found Legacy UART Service (FFF0)");
-                } else if (uuid->uuid.uuid16 == 0xFFE0) {
-                    is_uart_service = true;
-                    LOG_INFO(TAG, "📌 Found Legacy UART Service (FFE0)");
                 }
             }
             
             if (is_uart_service) {
                 svc_start = param->search_res.start_handle;
                 svc_end = param->search_res.end_handle;
-                LOG_INFO(TAG, "📌 UART service found: start=0x%04X end=0x%04X", svc_start, svc_end);
             }
             break;
         }
             
         case ESP_GATTC_SEARCH_CMPL_EVT:
-            LOG_INFO(TAG, "✅ Service discovery complete - attribute cache built");
-            
             if (svc_start == 0) {
-                LOG_ERROR(TAG, "❌ UART service not found during discovery");
                 break;
             }
             
-            // VEEPEAK 128-bit UUIDs ONLY (CONFIRMED BY nRF CONNECT) - enforce exact match
             const esp_bt_uuid_t uart_char_uuids[] = {
-                // VEEPEAK 128-bit RX: 0000fff1-0000-1000-8000-00805f9b34fb (CONFIRMED BY nRF CONNECT)
                 { .len = ESP_UUID_LEN_128,
                   .uuid = { .uuid128 = 
                       {0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80,
                        0x00, 0x10, 0x00, 0x00, 0xf1, 0xff, 0x00, 0x00} } },
-                // VEEPEAK 128-bit TX: 0000fff2-0000-1000-8000-00805f9b34fb (CONFIRMED BY nRF CONNECT)
                 { .len = ESP_UUID_LEN_128,
                   .uuid = { .uuid128 = 
                       {0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80,
                        0x00, 0x10, 0x00, 0x00, 0xf2, 0xff, 0x00, 0x00} } }
             };
             
-            LOG_INFO(TAG, "🔍 Looking for characteristics by UUID...");
             esp_gattc_char_elem_t char_elem;
             bool rx_found = false, tx_found = false;
             
-            // Search for both RX and TX characteristics, checking properties to distinguish them
             for (size_t i = 0; i < sizeof(uart_char_uuids)/sizeof(uart_char_uuids[0]) && (!rx_found || !tx_found); ++i) {
-                uint16_t count = 1;  // ← CRITICAL: Reset count before every call!
+                uint16_t count = 1;
                 esp_err_t ret = esp_ble_gattc_get_char_by_uuid(gattc_if, conn_id,
                                                               svc_start, svc_end,
                                                               uart_char_uuids[i], &char_elem, &count);
                 if (ret == ESP_OK && count > 0) {
-                    // Log detailed characteristic properties for debugging
-                    LOG_INFO(TAG, "🔍 Found characteristic: handle=0x%04X, properties=0x%02X, UUID index=%zu", 
-                             char_elem.char_handle, char_elem.properties, i);
-                    LOG_INFO(TAG, "   Properties: Read=%d, Write=%d, WriteNR=%d, Notify=%d, Indicate=%d",
-                             !!(char_elem.properties & ESP_GATT_CHAR_PROP_BIT_READ),
-                             !!(char_elem.properties & ESP_GATT_CHAR_PROP_BIT_WRITE),
-                             !!(char_elem.properties & ESP_GATT_CHAR_PROP_BIT_WRITE_NR),
-                             !!(char_elem.properties & ESP_GATT_CHAR_PROP_BIT_NOTIFY),
-                             !!(char_elem.properties & ESP_GATT_CHAR_PROP_BIT_INDICATE));
-                    
-                    // Check characteristic properties to determine if it's RX or TX
                     if ((char_elem.properties & ESP_GATT_CHAR_PROP_BIT_NOTIFY) && !rx_found) {
                         rx_char_handle = char_elem.char_handle;
                         rx_found = true;
-                        LOG_INFO(TAG, "✅ Assigned as RX characteristic (Notify capability) at handle: 0x%04X", rx_char_handle);
-                        if (!(char_elem.properties & ESP_GATT_CHAR_PROP_BIT_READ)) {
-                            LOG_WARN(TAG, "⚠️ RX characteristic does NOT support Read - polling will fail!");
-                        } else {
-                            LOG_INFO(TAG, "✅ RX characteristic supports Read - polling should work");
-                        }
                     } else if ((char_elem.properties & (ESP_GATT_CHAR_PROP_BIT_WRITE | ESP_GATT_CHAR_PROP_BIT_WRITE_NR)) && !tx_found) {
                         tx_char_handle = char_elem.char_handle;
                         tx_found = true;
-                        LOG_INFO(TAG, "✅ Assigned as TX characteristic (Write capability) at handle: 0x%04X", tx_char_handle);
                     }
                 }
             }
             
-            if (!rx_found) {
-                LOG_ERROR(TAG, "❌ VEEPEAK RX characteristic (0000fff1-...) not found!");
-                LOG_ERROR(TAG, "   This means UUID mismatch - VEEPEAK device may be using different UUIDs");
+            if (!rx_found || !tx_found) {
                 break;
             }
             
-            if (!tx_found) {
-                LOG_ERROR(TAG, "❌ VEEPEAK TX characteristic (0000fff2-...) not found!");
-                LOG_ERROR(TAG, "   This means UUID mismatch - VEEPEAK device may be using different UUIDs");
-                break;
-            }
-            
-            // Find the CCCD handle for notifications
-            LOG_INFO(TAG, "🔍 Looking for CCCD descriptor...");
             esp_bt_uuid_t cccd_uuid = {
                 .len = ESP_UUID_LEN_16,
                 .uuid = { .uuid16 = ESP_GATT_UUID_CHAR_CLIENT_CONFIG }
@@ -399,180 +280,64 @@ static void gattc_callback(esp_gattc_cb_event_t event, esp_gatt_if_t gatt_if, es
             
             if (descr_ret == ESP_OK && count > 0) {
                 rx_char_cccd_handle = descr_elem.handle;
-                LOG_INFO(TAG, "✅ Found CCCD at handle: 0x%04X", rx_char_cccd_handle);
             } else {
-                // Fallback to +1 (usually works)
                 rx_char_cccd_handle = rx_char_handle + 1;
-                LOG_WARN(TAG, "⚠️ CCCD not found in cache, trying fallback: 0x%04X", rx_char_cccd_handle);
-                
-                // Also try other possible CCCD handles for debugging
-                LOG_INFO(TAG, "🔧 Alternative CCCD candidates:");
-                LOG_INFO(TAG, "   RX+1: 0x%04X (using this)", rx_char_handle + 1);
-                LOG_INFO(TAG, "   TX+1: 0x%04X", tx_char_handle + 1);
-                LOG_INFO(TAG, "   Service end: 0x%04X", svc_end);
             }
             
-            // CRITICAL FIX: Register for notifications BEFORE writing CCCD
-            LOG_INFO(TAG, "📥 Step 1: Registering for notifications on ESP32 controller...");
-            esp_err_t reg_ret = esp_ble_gattc_register_for_notify(gattc_if, peer_bda, rx_char_handle);
-            if (reg_ret == ESP_OK) {
-                LOG_INFO(TAG, "✅ Registered for notifications on handle 0x%04X", rx_char_handle);
-            } else {
-                LOG_ERROR(TAG, "❌ register_for_notify failed: %s", esp_err_to_name(reg_ret));
-            }
+            esp_ble_gattc_register_for_notify(gattc_if, peer_bda, rx_char_handle);
             
-            // Enable notifications - detailed logging for debugging
             uint8_t enable_ntf[2] = {0x01, 0x00};
-            LOG_INFO(TAG, "📥 Step 2: Writing CCCD to enable notifications on VEEPEAK...");
-            LOG_INFO(TAG, "🔧 CCCD Write Details:");
-            LOG_INFO(TAG, "   RX char handle: 0x%04X", rx_char_handle);
-            LOG_INFO(TAG, "   CCCD handle: 0x%04X", rx_char_cccd_handle);
-            LOG_INFO(TAG, "   Writing bytes: 0x%02X 0x%02X (enable notifications)", enable_ntf[0], enable_ntf[1]);
-            
-            esp_err_t write_ret = esp_ble_gattc_write_char_descr(gattc_if, conn_id,
-                                                               rx_char_cccd_handle,
-                                                               sizeof(enable_ntf), enable_ntf,
-                                                               ESP_GATT_WRITE_TYPE_RSP,
-                                                               ESP_GATT_AUTH_REQ_NONE);
-            if (write_ret == ESP_OK) {
-                LOG_INFO(TAG, "✉️ Enabling notifications (CCCD 0x%04X)...", rx_char_cccd_handle);
-            } else {
-                LOG_ERROR(TAG, "❌ Failed to write CCCD: %s", esp_err_to_name(write_ret));
-            }
+            esp_ble_gattc_write_char_descr(gattc_if, conn_id,
+                                       rx_char_cccd_handle,
+                                       sizeof(enable_ntf), enable_ntf,
+                                       ESP_GATT_WRITE_TYPE_RSP,
+                                       ESP_GATT_AUTH_REQ_NONE);
             break;
             
         case ESP_GATTC_REG_FOR_NOTIFY_EVT:
-            LOG_INFO(TAG, "🎉 ESP32 controller registered for notifications successfully!");
-            LOG_INFO(TAG, "📥 Step 1 complete: ESP32 will now route incoming notifications to app");
-            LOG_INFO(TAG, "⏳ Step 2 pending: CCCD write to tell VEEPEAK to send notifications");
             break;
             
         case ESP_GATTC_WRITE_DESCR_EVT:
-            LOG_INFO(TAG, "📝 CCCD Write Result: handle=0x%04X, status=%d", param->write.handle, param->write.status);
             if (param->write.status == ESP_GATT_OK) {
-                
                 switch (cccd_state) {
                     case CCCD_STATE_INITIAL_ENABLE:
-                        LOG_INFO(TAG, "✅ Initial CCCD written - notifications enabled!");
-                        LOG_INFO(TAG, "🔔 RX notifications expected at handle 0x%04X", rx_char_handle);
-                        
-                        // VEEPEAK firmware quirk: disable notifications to reset device state
-                        LOG_INFO(TAG, "🔧 VEEPEAK disable/enable sequence (nRF Connect discovery)");
-                        LOG_INFO(TAG, "⏳ Step 1: Disabling notifications to reset VEEPEAK state...");
                         cccd_state = CCCD_STATE_DISABLING;
-                        
                         uint8_t disable_ntf[2] = {0x00, 0x00};
-                        esp_err_t disable_ret = esp_ble_gattc_write_char_descr(gattc_if, conn_id, rx_char_cccd_handle,
-                                                                              sizeof(disable_ntf), disable_ntf,
-                                                                              ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NONE);
-                        if (disable_ret != ESP_OK) {
-                            LOG_ERROR(TAG, "❌ Failed to disable notifications: %s", esp_err_to_name(disable_ret));
-                        }
+                        esp_ble_gattc_write_char_descr(gattc_if, conn_id, rx_char_cccd_handle,
+                                                      sizeof(disable_ntf), disable_ntf,
+                                                      ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NONE);
                         break;
                         
                     case CCCD_STATE_DISABLING:
-                        LOG_INFO(TAG, "✅ Notifications disabled successfully");
-                        LOG_INFO(TAG, "⏳ Step 2: Re-enabling notifications after 1-second delay...");
-                        vTaskDelay(pdMS_TO_TICKS(1000)); // Brief delay to ensure disable takes effect
+                        vTaskDelay(pdMS_TO_TICKS(1000));
                         cccd_state = CCCD_STATE_ENABLING;
-                        
                         uint8_t enable_ntf[2] = {0x01, 0x00};
-                        esp_err_t enable_ret = esp_ble_gattc_write_char_descr(gattc_if, conn_id, rx_char_cccd_handle,
-                                                                             sizeof(enable_ntf), enable_ntf,
-                                                                             ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NONE);
-                        if (enable_ret != ESP_OK) {
-                            LOG_ERROR(TAG, "❌ Failed to re-enable notifications: %s", esp_err_to_name(enable_ret));
-                        }
+                        esp_ble_gattc_write_char_descr(gattc_if, conn_id, rx_char_cccd_handle,
+                                                     sizeof(enable_ntf), enable_ntf,
+                                                     ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NONE);
                         break;
                         
                     case CCCD_STATE_ENABLING:
-                        LOG_INFO(TAG, "✅ Notifications re-enabled - VEEPEAK should now be responsive!");
-                        LOG_INFO(TAG, "🎉 VEEPEAK disable/enable sequence complete");
-                        
-                        // Skip polling since RX characteristic doesn't support reading
-                        LOG_INFO(TAG, "🚫 Polling disabled as RX characteristic does not support Read (status=0x02)");
-                        
-                        // Start initialization after successful re-enable (matching nRF Connect timing)
-                        LOG_INFO(TAG, "⏱️ Starting initialization after 5-second stabilization delay...");
-                        vTaskDelay(pdMS_TO_TICKS(5000)); // Allow device to stabilize
-                        LOG_INFO(TAG, "🚀 Starting ELM327 initialization...");
-                        // FIXED: Increased stack size from 4096 to 8192 for safety
+                        vTaskDelay(pdMS_TO_TICKS(5000));
                         xTaskCreate(initialize_elm327_task, "elm327_init", 8192, NULL, 2, NULL);
                         break;
                 }
-                
-            } else {
-                LOG_ERROR(TAG, "❌ CCCD write failed, status 0x%02X", param->write.status);
             }
             break;
             
-        case ESP_GATTC_CFG_MTU_EVT:
-            LOG_INFO(TAG, "📶 MTU configured: %d bytes (status: %d)", param->cfg_mtu.mtu, param->cfg_mtu.status);
-            break;
-            
-        case ESP_GATTC_NOTIFY_EVT: {
-            // SUCCESS! Received notification from ELM327
-            LOG_INFO(TAG, "🎉 SUCCESS! GATT NOTIFY received from handle 0x%04X", param->notify.handle);
-            LOG_INFO(TAG, "   Expected RX handle: 0x%04X %s", rx_char_handle, 
-                    (param->notify.handle == rx_char_handle) ? "(MATCH - PERFECT!)" : "(MISMATCH!)");
-            
+        case ESP_GATTC_NOTIFY_EVT:
             if (param->notify.handle == rx_char_handle) {
-                LOG_INFO(TAG, "⬇️ NOTIFY (%d bytes): %.*s", param->notify.value_len, param->notify.value_len, param->notify.value);
-                
-                // Also log as hex for debugging
-                printf("⬇️ NOTIFY HEX: ");
-                for (int i = 0; i < param->notify.value_len; i++) {
-                    printf("%02X ", param->notify.value[i]);
-                }
-                printf("\n");
-                
-                // Forward data to ELM327 handler 
                 handle_elm327_response((char *)param->notify.value, param->notify.value_len);
-            } else {
-                LOG_WARN(TAG, "⚠️ Notification from unexpected handle 0x%04X (expected 0x%04X)", 
-                         param->notify.handle, rx_char_handle);
-                LOG_WARN(TAG, "⚠️ Ignoring notification from wrong characteristic");
             }
             break;
-        }
-        
+            
         case ESP_GATTC_WRITE_CHAR_EVT:
-            if (param->write.status != ESP_GATT_OK) {
-                LOG_ERROR(TAG, "❌ Failed to write data: %d", param->write.status);
-            }
             break;
-
+            
         case ESP_GATTC_READ_CHAR_EVT:
-            // Polling is disabled since RX characteristic doesn't support Read
-            LOG_WARN(TAG, "⚠️ Unexpected READ_CHAR_EVT - polling disabled (RX characteristic read not supported)");
-            if (param->read.status != ESP_GATT_OK) {
-                LOG_INFO(TAG, "   Confirmed: Read failed with status=0x%02X (ESP_GATT_READ_NOT_PERMIT=0x02)", param->read.status);
-            }
             break;
             
-        case ESP_GATTC_READ_DESCR_EVT:
-            LOG_INFO(TAG, "📖 CCCD Read Result: handle=0x%04X, status=%d", param->read.handle, param->read.status);
-            if (param->read.status == ESP_GATT_OK) {
-                LOG_INFO(TAG, "📖 CCCD value (%d bytes): ", param->read.value_len);
-                printf("CCCD HEX: ");
-                for (int i = 0; i < param->read.value_len; i++) {
-                    printf("%02X ", param->read.value[i]);
-                }
-                printf("\n");
-                if (param->read.value_len >= 2) {
-                    uint16_t cccd_value = param->read.value[0] | (param->read.value[1] << 8);
-                    LOG_INFO(TAG, "📖 CCCD value: 0x%04X %s", cccd_value, 
-                            (cccd_value & 0x01) ? "(Notifications enabled)" : "(Notifications disabled)");
-                }
-            } else {
-                LOG_ERROR(TAG, "❌ Failed to read CCCD: status=%d", param->read.status);
-            }
-            break;
-            
-
         default:
-            // Only log truly unhandled events
-            LOG_WARN(TAG, "⚠️ Unhandled GATT Event: %d", event);
             break;
     }
 }
@@ -607,11 +372,11 @@ esp_err_t ble_uart_write(uint8_t *data, size_t len) {
     LOG_BT(TAG, "⬆️ SEND (%zu bytes): %s", len, display_buffer);
     
     // Also log hex bytes for complete verification
-    printf("⬆️ SEND HEX: ");
-    for (size_t i = 0; i < len; i++) {
-        printf("%02X ", data[i]);
-    }
-    printf("\n");
+    // printf("⬆️ SEND HEX: ");
+    // for (size_t i = 0; i < len; i++) {
+    //     printf("%02X ", data[i]);
+    // }
+    // printf("\n");
     
     return esp_ble_gattc_write_char(gattc_if, conn_id, tx_char_handle,
                                    len, data, ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NONE);
@@ -620,7 +385,7 @@ esp_err_t ble_uart_write(uint8_t *data, size_t len) {
 // Start BLE scanning
 void start_ble_scan(void) {
     if (is_scanning) {
-        ESP_LOGD(TAG, "🔍 BLE scan already in progress");
+        LOG_DEBUG(TAG, "🔍 BLE scan already in progress");
         return;
     }
     

@@ -18,7 +18,7 @@
 // VEEPEAK adapter (no OBD, relays, etc.)
 // FIXED: Now properly initializes ELM327 system to prevent semaphore crashes
 // NOTE: Disable for full app testing with OBD data collection and relay control
-#define BT_TEST_MODE 1
+#define BT_TEST_MODE 0
 
 #if BT_TEST_MODE
 
