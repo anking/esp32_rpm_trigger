@@ -1,6 +1,8 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "driver/ledc.h"
+#include "driver/rmt.h"
 #include "logging_config.h"
 #include "gpio_control.h"
 #include "bluetooth.h"
@@ -19,40 +21,56 @@ static bool auto_injection_mode = false;
 static bool nos_conditions_met = false;
 static nvs_handle_t nvs_storage_handle;
 
+// RGB LED control (RMT-based WS2812)
+static bool rgb_led_initialized = false;
+#define WS2812_T0H_NS (350)
+#define WS2812_T0L_NS (1000)
+#define WS2812_T1H_NS (1000)
+#define WS2812_T1L_NS (350)
+#define WS2812_RESET_US (280)
+
+// Buzzer control
+static bool buzzer_initialized = false;
+
 // Forward declarations
 static void button_isr_handler(void* arg);
 static void save_auto_injection_mode(bool mode);
 static bool load_auto_injection_mode(void);
+static void init_rgb_led(void);
+static void init_buzzer(void);
 
 // Initialize GPIO system
 void gpio_init_system(void) {
-    LOG_VERBOSE(TAG, "Initializing GPIO system...");
+    LOG_VERBOSE(TAG, "Initializing GPIO system for ESP32-S3 Relay Board...");
     
-    // Configure output GPIO pins
-    gpio_config_t out_conf = {};
-    out_conf.intr_type = GPIO_INTR_DISABLE;
-    out_conf.mode = GPIO_MODE_OUTPUT;
-    out_conf.pin_bit_mask = (1ULL << BT_ECU_LED_PIN) | 
-                           (1ULL << NOS_READY_PIN) | 
-                           (1ULL << NOS_AUTO_INJ_PIN);
-    out_conf.pull_down_en = 0;
-    out_conf.pull_up_en = 0;
+    // Configure relay output GPIO pins
+    gpio_config_t relay_conf = {};
+    relay_conf.intr_type = GPIO_INTR_DISABLE;
+    relay_conf.mode = GPIO_MODE_OUTPUT;
+    relay_conf.pin_bit_mask = (1ULL << RELAY_1_PIN) | 
+                             (1ULL << RELAY_2_PIN) | 
+                             (1ULL << RELAY_3_PIN) | 
+                             (1ULL << RELAY_4_PIN) | 
+                             (1ULL << RELAY_5_PIN) | 
+                             (1ULL << RELAY_6_PIN);
+    relay_conf.pull_down_en = 0;
+    relay_conf.pull_up_en = 0;
     
-    esp_err_t ret = gpio_config(&out_conf);
+    esp_err_t ret = gpio_config(&relay_conf);
     if (ret != ESP_OK) {
-        LOG_ERROR(TAG, "Failed to initialize output GPIO: %s", esp_err_to_name(ret));
+        LOG_ERROR(TAG, "Failed to initialize relay GPIO: %s", esp_err_to_name(ret));
         return;
     }
     
     // Configure button input pin
-    gpio_config_t in_conf = {};
-    in_conf.intr_type = GPIO_INTR_NEGEDGE;  // Trigger on falling edge (button press)
-    in_conf.mode = GPIO_MODE_INPUT;
-    in_conf.pin_bit_mask = (1ULL << BUTTON_PIN);
-    in_conf.pull_down_en = 0;
-    in_conf.pull_up_en = 1;  // Enable pull-up for button
+    gpio_config_t btn_conf = {};
+    btn_conf.intr_type = GPIO_INTR_NEGEDGE;  // Trigger on falling edge (button press)
+    btn_conf.mode = GPIO_MODE_INPUT;
+    btn_conf.pin_bit_mask = (1ULL << BUTTON_PIN);
+    btn_conf.pull_down_en = 0;
+    btn_conf.pull_up_en = 1;  // Enable pull-up for button
     
-    ret = gpio_config(&in_conf);
+    ret = gpio_config(&btn_conf);
     if (ret != ESP_OK) {
         LOG_ERROR(TAG, "Failed to initialize button GPIO: %s", esp_err_to_name(ret));
         return;
@@ -72,13 +90,23 @@ void gpio_init_system(void) {
         return;
     }
     
-    // Initialize all output pins to LOW (off/inactive)
-    gpio_set_level(BT_ECU_LED_PIN, 0);
-    gpio_set_level(NOS_READY_PIN, 0);
-    gpio_set_level(NOS_AUTO_INJ_PIN, 0);
+    // Initialize all relays to OFF (inactive)
+    gpio_set_level(RELAY_1_PIN, 0);
+    gpio_set_level(RELAY_2_PIN, 0);
+    gpio_set_level(RELAY_3_PIN, 0);
+    gpio_set_level(RELAY_4_PIN, 0);
+    gpio_set_level(RELAY_5_PIN, 0);
+    gpio_set_level(RELAY_6_PIN, 0);
     
-    LOG_VERBOSE(TAG, "GPIO initialized - BT/ECU LED: %d, NOS Ready: %d, NOS Auto: %d, Button: %d", 
-               BT_ECU_LED_PIN, NOS_READY_PIN, NOS_AUTO_INJ_PIN, BUTTON_PIN);
+    // Initialize RGB LED
+    init_rgb_led();
+    
+    // Initialize buzzer
+    init_buzzer();
+    
+    LOG_VERBOSE(TAG, "GPIO initialized - Relays: %d,%d,%d,%d,%d,%d, RGB LED: %d, Buzzer: %d, Button: %d", 
+               RELAY_1_PIN, RELAY_2_PIN, RELAY_3_PIN, RELAY_4_PIN, RELAY_5_PIN, RELAY_6_PIN,
+               WS2812_RGB_LED_PIN, BUZZER_PIN, BUTTON_PIN);
     
     // Initialize NVS for persistent storage
     esp_err_t nvs_ret = nvs_open("gpio_storage", NVS_READWRITE, &nvs_storage_handle);
@@ -89,12 +117,64 @@ void gpio_init_system(void) {
         auto_injection_mode = load_auto_injection_mode();
         LOG_INFO(TAG, "Auto injection mode loaded: %s", auto_injection_mode ? "ENABLED" : "DISABLED");
     }
+    
+    // Play startup sound
+    play_startup_sound();
 }
 
-// Internal LED control (used only by bluetooth_led_task)
-static void set_bt_ecu_led(bool active) {
-    gpio_set_level(BT_ECU_LED_PIN, active ? 1 : 0);
-    LOG_DEBUG(TAG, "BT/ECU LED: %s", active ? "ON (active)" : "OFF (inactive)");
+// Initialize RGB LED
+static void init_rgb_led(void) {
+    rmt_config_t config = RMT_DEFAULT_CONFIG_TX(WS2812_RGB_LED_PIN, RMT_CHANNEL_0);
+    config.clk_div = 2;
+    
+    esp_err_t ret = rmt_config(&config);
+    if (ret == ESP_OK) {
+        ret = rmt_driver_install(config.channel, 0, 0);
+    }
+    
+    if (ret == ESP_OK) {
+        rgb_led_initialized = true;
+        LOG_VERBOSE(TAG, "RGB LED initialized on GPIO %d using RMT", WS2812_RGB_LED_PIN);
+        // Set initial color (off)
+        set_rgb_led(0, 0, 0);
+    } else {
+        LOG_ERROR(TAG, "Failed to initialize RGB LED: %s", esp_err_to_name(ret));
+    }
+}
+
+// Initialize buzzer
+static void init_buzzer(void) {
+    ledc_timer_config_t ledc_timer = {
+        .duty_resolution = LEDC_TIMER_13_BIT,
+        .freq_hz = 1000,  // Default frequency
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .timer_num = LEDC_TIMER_0,
+        .clk_cfg = LEDC_AUTO_CLK,
+    };
+    
+    esp_err_t ret = ledc_timer_config(&ledc_timer);
+    if (ret != ESP_OK) {
+        LOG_ERROR(TAG, "Failed to configure LEDC timer: %s", esp_err_to_name(ret));
+        return;
+    }
+    
+    ledc_channel_config_t ledc_channel = {
+        .channel = LEDC_CHANNEL_0,
+        .duty = 0,  // Start with buzzer off
+        .gpio_num = BUZZER_PIN,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .hpoint = 0,
+        .timer_sel = LEDC_TIMER_0,
+    };
+    
+    ret = ledc_channel_config(&ledc_channel);
+    if (ret != ESP_OK) {
+        LOG_ERROR(TAG, "Failed to configure LEDC channel: %s", esp_err_to_name(ret));
+        return;
+    }
+    
+    buzzer_initialized = true;
+    LOG_VERBOSE(TAG, "Buzzer initialized on GPIO %d", BUZZER_PIN);
 }
 
 // Set ECU connection status
@@ -120,9 +200,9 @@ void trigger_led_burst(void) {
               auto_injection_mode ? "ENABLED" : "DISABLED");
     
     for (int i = 0; i < 3; i++) {
-        set_bt_ecu_led(true);
+        set_rgb_led(255, 0, 0); // Red for burst
         vTaskDelay(pdMS_TO_TICKS(100));  // 100ms on
-        set_bt_ecu_led(false);
+        set_rgb_led(0, 0, 0);
         vTaskDelay(pdMS_TO_TICKS(100));  // 100ms off
     }
     
@@ -130,16 +210,16 @@ void trigger_led_burst(void) {
     LOG_DEBUG(TAG, "LED burst complete");
 }
 
-// NOS readiness output control
+// NOS readiness output control (using relay!)
 void set_nos_ready(bool ready) {
-    gpio_set_level(NOS_READY_PIN, ready ? 1 : 0);
-    LOG_DEBUG(TAG, "NOS Ready: %s", ready ? "HIGH (ready)" : "LOW (not ready)");
+    gpio_set_level(NOS_READY_RELAY, ready ? 1 : 0);
+    LOG_DEBUG(TAG, "NOS Ready Relay: %s", ready ? "ACTIVATED (ready)" : "DEACTIVATED (not ready)");
 }
 
-// NOS auto injection control
+// NOS auto injection control (using relay!)
 void set_nos_auto_injection(bool active) {
-    gpio_set_level(NOS_AUTO_INJ_PIN, active ? 1 : 0);
-    LOG_DEBUG(TAG, "NOS Auto Injection: %s", active ? "HIGH (active)" : "LOW (inactive)");
+    gpio_set_level(NOS_AUTO_INJ_RELAY, active ? 1 : 0);
+    LOG_DEBUG(TAG, "NOS Auto Injection Relay: %s", active ? "ACTIVATED (injecting)" : "DEACTIVATED (off)");
 }
 
 // NVS storage functions
@@ -248,34 +328,115 @@ void bluetooth_led_task(void *pv) {
             // Both BT and ECU connected
             if (auto_injection_mode) {
                 // Auto injection mode: Blink (off for 200ms every 1s)
-                set_bt_ecu_led(true);
+                set_rgb_led(255, 0, 0); // Red for auto injection mode
                 vTaskDelay(pdMS_TO_TICKS(800));   // On for 800ms
-                set_bt_ecu_led(false);
+                set_rgb_led(0, 0, 0);
                 vTaskDelay(pdMS_TO_TICKS(200));   // Off for 200ms (blink)
             } else {
                 // Normal mode: Solid ON
-                set_bt_ecu_led(true);
+                set_rgb_led(255, 255, 255); // White for normal mode
                 vTaskDelay(pdMS_TO_TICKS(1000));  // Check every second
             }
             
         } else if (is_connected && !ecu_connected) {
             // Fast flash - BT connected, ECU connecting/searching
-            set_bt_ecu_led(true);
+            set_rgb_led(255, 0, 0); // Red for fast flash
             vTaskDelay(pdMS_TO_TICKS(100));   // On for 100ms
-            set_bt_ecu_led(false);
+            set_rgb_led(0, 0, 0);
             vTaskDelay(pdMS_TO_TICKS(150));   // Off for 150ms (250ms cycle = fast)
             
-        } else if (is_searching || is_connecting) {
+        } else if (is_scanning || is_connecting) {
             // Slow flash - BT connecting/searching
-            set_bt_ecu_led(true);
+            set_rgb_led(255, 0, 0); // Red for slow flash
             vTaskDelay(pdMS_TO_TICKS(300));   // On for 300ms
-            set_bt_ecu_led(false);
+            set_rgb_led(0, 0, 0);
             vTaskDelay(pdMS_TO_TICKS(700));   // Off for 700ms (1000ms cycle = slow)
             
         } else {
             // OFF - nothing connected
-            set_bt_ecu_led(false);
+            set_rgb_led(0, 0, 0);
             vTaskDelay(pdMS_TO_TICKS(500));   // Check every 500ms
         }
     }
+} 
+
+// RGB LED control function
+void set_rgb_led(uint8_t red, uint8_t green, uint8_t blue) {
+    if (!rgb_led_initialized) {
+        LOG_DEBUG(TAG, "RGB LED not initialized");
+        return;
+    }
+    
+    // WS2812 expects GRB format, not RGB
+    uint32_t color = (green << 16) | (red << 8) | blue;
+    
+    rmt_item32_t data[24];  // 24 bits for one LED (8 bits each for G, R, B)
+    
+    for (int i = 0; i < 24; i++) {
+        uint32_t bit = (color >> (23 - i)) & 1;
+        if (bit) {
+            // Send '1' bit
+            data[i].level0 = 1;
+            data[i].duration0 = 40; // ~800ns at 80MHz / 2
+            data[i].level1 = 0;
+            data[i].duration1 = 17; // ~350ns
+        } else {
+            // Send '0' bit
+            data[i].level0 = 1;
+            data[i].duration0 = 17; // ~350ns
+            data[i].level1 = 0;
+            data[i].duration1 = 40; // ~800ns
+        }
+    }
+    
+    rmt_write_items(RMT_CHANNEL_0, data, 24, true);
+}
+
+// Buzzer control function
+void play_beep(uint16_t frequency, uint16_t duration_ms) {
+    if (!buzzer_initialized) {
+        LOG_DEBUG(TAG, "Buzzer not initialized");
+        return;
+    }
+    
+    // Set frequency
+    ledc_set_freq(LEDC_LOW_SPEED_MODE, LEDC_TIMER_0, frequency);
+    
+    // Set duty cycle to 50% (4096 out of 8192 for 13-bit resolution)
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 4096);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+    
+    // Play for specified duration
+    vTaskDelay(pdMS_TO_TICKS(duration_ms));
+    
+    // Turn off buzzer
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+}
+
+// Sound effects
+void play_startup_sound(void) {
+    LOG_INFO(TAG, "🔊 Playing startup sound");
+    set_rgb_led(0, 255, 0);  // Green
+    play_beep(800, 200);
+    play_beep(1000, 200);
+    play_beep(1200, 300);
+    set_rgb_led(0, 0, 0);    // Off
+}
+
+void play_connection_sound(void) {
+    LOG_INFO(TAG, "🔊 Playing connection sound");
+    set_rgb_led(0, 0, 255);  // Blue
+    play_beep(1000, 100);
+    play_beep(1200, 100);
+    set_rgb_led(0, 0, 0);    // Off
+}
+
+void play_error_sound(void) {
+    LOG_ERROR(TAG, "🔊 Playing error sound");
+    set_rgb_led(255, 0, 0);  // Red
+    play_beep(400, 200);
+    play_beep(300, 200);
+    play_beep(200, 300);
+    set_rgb_led(0, 0, 0);    // Off
 } 

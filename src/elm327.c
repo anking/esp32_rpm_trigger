@@ -1,5 +1,4 @@
 #include "esp_log.h"
-#include "esp_spp_api.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -8,6 +7,9 @@
 #include "bluetooth.h"
 #include "obd_data.h"
 #include "gpio_control.h"
+
+// External declarations from bluetooth.h
+extern uint16_t tx_char_handle;
 
 static const char *TAG = "ELM327";
 
@@ -59,7 +61,7 @@ void elm327_init_system(void) {
 
 // ELM327 specific command sending with error handling
 esp_err_t elm327_send_command_with_options(const char *cmd, bool wait_for_prompt) {
-    if (!is_connected || !spp_handle) {
+    if (!is_connected || tx_char_handle == 0) {
         ESP_LOGW(TAG, "⚠️ Not connected to ELM327");
         return ESP_ERR_INVALID_STATE;
     }
@@ -93,7 +95,7 @@ esp_err_t elm327_send_command_with_options(const char *cmd, bool wait_for_prompt
     char formatted_cmd[32];
     int len = snprintf(formatted_cmd, sizeof(formatted_cmd), "%s\r", cmd);
     
-    esp_err_t ret = esp_spp_write(spp_handle, len, (uint8_t *)formatted_cmd);
+    esp_err_t ret = ble_uart_write((uint8_t *)formatted_cmd, len);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "⚠️ Failed to send '%s': %s", cmd, esp_err_to_name(ret));
     }
@@ -173,6 +175,15 @@ void elm327_handle_response(const char *response) {
         // Signal response received AFTER data processing is complete
         response_received_flag = true;
     }
+}
+
+// Handle ELM327 response received via BLE (bridge function)
+void handle_elm327_response(const char *data, size_t len) {
+    // Convert size_t to uint16_t for existing function
+    uint16_t data_len = (len > UINT16_MAX) ? UINT16_MAX : (uint16_t)len;
+    
+    // Forward to existing data processing function
+    process_received_data(data, data_len);
 }
 
 // Process OBD data responses

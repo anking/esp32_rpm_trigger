@@ -66,7 +66,7 @@ void app_main(void) {
     // Start device discovery immediately
     LOG_INFO(TAG, "Starting device search...");
     vTaskDelay(pdMS_TO_TICKS(100));  // Brief delay for system stability
-    start_device_discovery();
+    start_ble_scan();
     LOG_INFO(TAG, "Device search started");
     
     // Create OBD data polling task

@@ -20,6 +20,7 @@ extern uint16_t rx_buffer_len;
 void elm327_init_system(void);
 void initialize_elm327(void);
 void initialize_elm327_task(void *pv);
+void handle_elm327_response(const char *data, size_t len);
 void process_received_data(const char *data, uint16_t len);
 
 // ECU connectivity verification

@@ -8,332 +8,371 @@
 #include "elm327.h"
 #include "gpio_control.h"
 
-static const char *TAG = "BLUETOOTH";
+// Forward declarations for sound functions
+extern void play_connection_sound(void);
+extern void play_error_sound(void);
 
-// Global Bluetooth state variables
+static const char *TAG = "BLE";
+
+// Global BLE state variables
 bool is_connected = false;
 bool is_connecting = false;
-bool is_searching = false;
-uint32_t spp_handle = 0;
-uint8_t target_elm327_bda[6] = ELM327_BT_ADDR;
+bool is_scanning = false;
+uint16_t gattc_if = ESP_GATT_IF_NONE;
+uint16_t conn_id = 0;
+
+// Target ELM327 device address (VEEPEAK BLE ELM327)
+esp_bd_addr_t target_elm327_addr = {0x66, 0x1E, 0x87, 0x02, 0x64, 0xC1};  // VEEPEAK ELM327
+
+// GATT handles for UART service
+uint16_t uart_service_handle = 0;
+uint16_t tx_char_handle = 0;
+uint16_t rx_char_handle = 0;
+uint16_t rx_char_cccd_handle = 0;
+
+// Nordic UART Service UUIDs
+static esp_bt_uuid_t uart_service_uuid = {
+    .len = ESP_UUID_LEN_128,
+    .uuid = {.uuid128 = {0x21, 0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0x5E, 0xE5, 0xA9, 0xE0, 0x93, 0xF3, 0xA3, 0xB5, 0x01, 0x6E}}
+};
+
+// TX and RX UUIDs will be discovered dynamically
+
 static int connection_attempt = 0;
 
-// Forward declaration
-void restart_discovery_task(void *pvParameters);
-void discovery_timeout_task(void *pvParameters);
+// Forward declarations
+void restart_scan_task(void *pvParameters);
+void scan_timeout_task(void *pvParameters);
 void reconnection_watchdog_task(void *pvParameters);
 
-// GAP callback for device discovery
-static void gap_callback(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param) {
+// Helper function to compare BD addresses
+static bool bd_addr_equal(esp_bd_addr_t a, esp_bd_addr_t b) {
+    return memcmp(a, b, ESP_BD_ADDR_LEN) == 0;
+}
+
+// GAP callback for BLE scanning
+static void gap_callback(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) {
     switch (event) {
-        case ESP_BT_GAP_DISC_RES_EVT: {
-            char addr_str[18];
-            snprintf(addr_str, sizeof(addr_str), "%02X:%02X:%02X:%02X:%02X:%02X",
-                    param->disc_res.bda[0], param->disc_res.bda[1], param->disc_res.bda[2],
-                    param->disc_res.bda[3], param->disc_res.bda[4], param->disc_res.bda[5]);
+        case ESP_GAP_BLE_SCAN_RESULT_EVT: {
+            esp_ble_gap_cb_param_t *scan_result = (esp_ble_gap_cb_param_t *)param;
             
-            // Check if this is our target ELM327 device
-            if (memcmp(param->disc_res.bda, target_elm327_bda, 6) == 0) {
-                if (is_connecting) {
-                    ESP_LOGD(TAG, "🎯 Already connecting to ELM327, ignoring duplicate discovery");
-                    break;
-                }
+            if (scan_result->scan_rst.search_evt == ESP_GAP_SEARCH_INQ_RES_EVT) {
+                char addr_str[18];
+                snprintf(addr_str, sizeof(addr_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+                        scan_result->scan_rst.bda[0], scan_result->scan_rst.bda[1], 
+                        scan_result->scan_rst.bda[2], scan_result->scan_rst.bda[3],
+                        scan_result->scan_rst.bda[4], scan_result->scan_rst.bda[5]);
                 
-                LOG_INFO(TAG, "Found ELM327: %s", addr_str);
-                LOG_BT(TAG, "Attempting connection to ELM327...");
-                
-                is_connecting = true;  // Mark as connecting to prevent multiple attempts
-                esp_bt_gap_cancel_discovery();
-                
-                // Give ELM327 time to be ready for connection
-                LOG_BT(TAG, "Waiting 2 seconds before connection attempt...");
-                vTaskDelay(pdMS_TO_TICKS(2000));
-                
-                // Connect directly to SCN 2 (discovered working channel)
-                LOG_BT(TAG, "Connecting to ELM327 on SCN 2 (verified working channel)...");
-                esp_err_t ret = esp_spp_connect(ESP_SPP_SEC_NONE, ESP_SPP_ROLE_MASTER, 2, param->disc_res.bda);
-                if (ret != ESP_OK) {
-                    LOG_WARN(TAG, "SCN 2 failed (%s), trying SCN 1 fallback...", esp_err_to_name(ret));
-                    vTaskDelay(pdMS_TO_TICKS(1000));  // Brief wait
-                    ret = esp_spp_connect(ESP_SPP_SEC_NONE, ESP_SPP_ROLE_MASTER, 1, param->disc_res.bda);
+                // Check if this is our target ELM327 device
+                if (bd_addr_equal(scan_result->scan_rst.bda, target_elm327_addr)) {
+                    if (is_connecting) {
+                        ESP_LOGD(TAG, "🎯 Already connecting to ELM327, ignoring duplicate discovery");
+                        return;
+                    }
+                    
+                    LOG_INFO(TAG, "🎯 Found target ELM327 BLE device: %s", addr_str);
+                    LOG_BT(TAG, "Attempting BLE connection to ELM327...");
+                    
+                    is_connecting = true;
+                    esp_ble_gap_stop_scanning();
+                    
+                    // Connect to the ELM327 device
+                    esp_err_t ret = esp_ble_gattc_open(gattc_if, scan_result->scan_rst.bda, 
+                                                     scan_result->scan_rst.ble_addr_type, true);
                     if (ret != ESP_OK) {
-                        LOG_ERROR(TAG, "Both SCN 2 and SCN 1 failed: %s", esp_err_to_name(ret));
+                        LOG_ERROR(TAG, "❌ Failed to initiate connection: %s", esp_err_to_name(ret));
                         is_connecting = false;
                     } else {
-                        LOG_INFO(TAG, "SCN 1 fallback connection initiated");
+                        LOG_INFO(TAG, "✅ BLE connection initiated");
                     }
                 } else {
-                    LOG_INFO(TAG, "SCN 2 connection initiated");
+                    ESP_LOGD(TAG, "📱 Found other BLE device: [%s] - skipping", addr_str);
                 }
-            } else {
-                ESP_LOGD(TAG, "📱 Found other device: [%s] - skipping", addr_str);
             }
             break;
         }
         
-        case ESP_BT_GAP_DISC_STATE_CHANGED_EVT:
-            if (param->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STOPPED) {
-                ESP_LOGI(TAG, "🔍 Device discovery stopped");
-                is_searching = false;
+        case ESP_GAP_BLE_SCAN_START_COMPLETE_EVT:
+            if (param->scan_start_cmpl.status == ESP_BT_STATUS_SUCCESS) {
+                LOG_BT(TAG, "🔍 BLE scan started successfully");
+                is_scanning = true;
                 
-                if (!is_connecting && !is_connected) {
-                    // Discovery completed but device not found - restart discovery
-                    ESP_LOGW(TAG, "🔄 ELM327 not found during discovery - will retry in 5 seconds");
-                    
-                    // Create a task to restart discovery after delay (non-blocking)
-                    xTaskCreate(restart_discovery_task, "restart_discovery", 2048, NULL, 3, NULL);
-                }
+                // Create timeout task to restart scan if no device found
+                xTaskCreate(scan_timeout_task, "scan_timeout", 2048, NULL, 3, NULL);
+            } else {
+                LOG_ERROR(TAG, "❌ Failed to start BLE scan: %d", param->scan_start_cmpl.status);
+            }
+            break;
+            
+        case ESP_GAP_BLE_SCAN_STOP_COMPLETE_EVT:
+            LOG_BT(TAG, "🔍 BLE scan stopped");
+            is_scanning = false;
+            
+            if (!is_connecting && !is_connected) {
+                // Scan completed but device not found - restart scan
+                ESP_LOGW(TAG, "🔄 ELM327 not found during scan - will retry in 5 seconds");
+                xTaskCreate(restart_scan_task, "restart_scan", 2048, NULL, 3, NULL);
             }
             break;
             
         default:
-            ESP_LOGD(TAG, "GAP event: %d", event);
+            ESP_LOGD(TAG, "GAP BLE event: %d", event);
             break;
     }
 }
 
-// SPP callback for connection events and data
-static void spp_callback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param) {
+// GATT client callback for connection and service discovery
+static void gattc_callback(esp_gattc_cb_event_t event, esp_gatt_if_t gatt_if, esp_ble_gattc_cb_param_t *param) {
     switch (event) {
-        case ESP_SPP_INIT_EVT:
-            LOG_BT(TAG, "SPP initialized");
+        case ESP_GATTC_REG_EVT:
+            LOG_BT(TAG, "GATT client registered, interface: %d", gatt_if);
+            gattc_if = gatt_if;
+            
+            // Start scanning for ELM327 device
+            start_ble_scan();
             break;
             
-        case ESP_SPP_START_EVT:
-            LOG_BT(TAG, "SPP server started");
+        case ESP_GATTC_CONNECT_EVT:
+            conn_id = param->connect.conn_id;
+            LOG_BT(TAG, "✅ Connected to ELM327 BLE device");
+            LOG_INFO(TAG, "🔗 BLE connection established - discovering services...");
+            
+            // Start service discovery
+            esp_ble_gattc_search_service(gatt_if, conn_id, &uart_service_uuid);
             break;
             
-        case ESP_SPP_CL_INIT_EVT:
-            LOG_BT(TAG, "SPP client initiated");
+        case ESP_GATTC_DISCONNECT_EVT:
+            LOG_WARN(TAG, "🔴 Disconnected from ELM327 (reason: %d)", param->disconnect.reason);
+            is_connected = false;
+            is_connecting = false;
+            conn_id = 0;
+            
+            // Reset handles
+            uart_service_handle = 0;
+            tx_char_handle = 0;
+            rx_char_handle = 0;
+            rx_char_cccd_handle = 0;
+            
+            set_ecu_status(false);
+            
+            // Play error sound for disconnection
+            play_error_sound();
+            
+            // Start reconnection attempts
+            xTaskCreate(reconnection_watchdog_task, "reconnect_watchdog", 4096, NULL, 2, NULL);
             break;
             
-        case ESP_SPP_OPEN_EVT:
-            LOG_INFO(TAG, "RFCOMM connection established");
+        case ESP_GATTC_SEARCH_RES_EVT:
+            // For simplicity, assume first service found is our UART service
+            uart_service_handle = param->search_res.start_handle;
+            LOG_BT(TAG, "🔍 Found service, handle: %d", uart_service_handle);
+            break;
+            
+        case ESP_GATTC_SEARCH_CMPL_EVT:
+            if (uart_service_handle != 0) {
+                LOG_BT(TAG, "✅ Service discovery complete - finding characteristics...");
+                // Get all characteristics of the UART service
+                // For now, manually set characteristic handles (simplified approach)
+                tx_char_handle = uart_service_handle + 2;  // Typically offset +2 for TX
+                rx_char_handle = uart_service_handle + 3;  // Typically offset +3 for RX
+                
+                LOG_BT(TAG, "📤 Assuming TX characteristic handle: %d", tx_char_handle);
+                LOG_BT(TAG, "📥 Assuming RX characteristic handle: %d", rx_char_handle);
+                
+                // Register for notifications on RX characteristic
+                esp_ble_gattc_register_for_notify(gatt_if, target_elm327_addr, rx_char_handle);
+            } else {
+                LOG_ERROR(TAG, "❌ UART service not found");
+                esp_ble_gattc_close(gatt_if, conn_id);
+            }
+            break;
+            
+        case ESP_GATTC_REG_FOR_NOTIFY_EVT:
+            LOG_BT(TAG, "✅ Notifications enabled - BLE UART ready!");
             is_connected = true;
             is_connecting = false;
-            is_searching = false;
             
-            if (param) {
-                spp_handle = param->open.handle;
+            // Play connection sound and start ELM327 initialization
+            play_connection_sound();
+            xTaskCreate(initialize_elm327_task, "elm327_init", 4096, NULL, 3, NULL);
+            break;
+            
+
+            
+        case ESP_GATTC_NOTIFY_EVT: {
+            // Received data from ELM327
+            LOG_BT(TAG, "⬇️ RECV (%d bytes): %.*s", param->notify.value_len, param->notify.value_len, param->notify.value);
+            
+            // Forward data to ELM327 handler
+            handle_elm327_response((char *)param->notify.value, param->notify.value_len);
+            break;
+        }
+        
+        case ESP_GATTC_WRITE_CHAR_EVT:
+            if (param->write.status != ESP_GATT_OK) {
+                LOG_ERROR(TAG, "❌ Failed to write data: %d", param->write.status);
             }
-            // LED control is now automatic via bluetooth_led_task
-            
-            // Create task for delayed ELM327 initialization to prevent immediate disconnection
-            LOG_VERBOSE(TAG, "Scheduling ELM327 initialization...");
-            xTaskCreate(initialize_elm327_task, "elm327_init", 4096, NULL, 5, NULL);
-            break;
-            
-        case ESP_SPP_CLOSE_EVT:
-            LOG_WARN(TAG, "Bluetooth connection closed");
-            is_connecting = false;   // Reset connection attempt state
-            is_connected = false;    // No longer connected
-            elm327_initialized = false;
-            set_ecu_status(false);   // Update ECU status for LED control
-            // LED control is now automatic via bluetooth_led_task
-            
-            handle_connection_failure();
-            break;
-            
-        case ESP_SPP_DATA_IND_EVT:
-            if (param && param->data_ind.data && param->data_ind.len > 0) {
-                LOG_DEBUG(TAG, "Data received: %.*s", param->data_ind.len, param->data_ind.data);
-                process_received_data((const char *)param->data_ind.data, param->data_ind.len);
-            }
-            break;
-            
-        case ESP_SPP_CONG_EVT:
-            ESP_LOGW(TAG, "⚠️  SPP congestion occurred");
             break;
             
         default:
-            ESP_LOGD(TAG, "SPP event: %d", event);
+            ESP_LOGD(TAG, "GATT client event: %d", event);
             break;
     }
 }
 
-// Handle connection failures with infinite retry logic
-void handle_connection_failure(void) {
-    connection_attempt++;
-    ESP_LOGI(TAG, "🔄 Connection failed - retry attempt #%d...", connection_attempt);
-    
-    vTaskDelay(pdMS_TO_TICKS(2000));  // Wait before retry
-    
-    if (connection_attempt % 3 == 1) {
-        // Try SCN 2 (known working channel)
-        ESP_LOGI(TAG, "📡 Retry: SCN 2 (primary channel)...");
-        if (esp_spp_connect(ESP_SPP_SEC_NONE, ESP_SPP_ROLE_MASTER, 2, target_elm327_bda) == ESP_OK) {
-            is_connecting = true;
-            ESP_LOGI(TAG, "✅ SCN 2 retry connection initiated");
-            return;
-        }
-    } else if (connection_attempt % 3 == 2) {
-        // Try SCN 1 (fallback)
-        ESP_LOGI(TAG, "📡 Retry: SCN 1 (fallback channel)...");
-        if (esp_spp_connect(ESP_SPP_SEC_NONE, ESP_SPP_ROLE_MASTER, 1, target_elm327_bda) == ESP_OK) {
-            is_connecting = true;
-            ESP_LOGI(TAG, "✅ SCN 1 retry connection initiated");
-            return;
-        }
-    } else {
-        // Reset counter and restart discovery (infinite reconnection)
-        ESP_LOGI(TAG, "🔄 Direct connection attempts failed, restarting discovery...");
-        connection_attempt = 0;  // Reset counter for next cycle
+// Write data to ELM327 via BLE UART
+esp_err_t ble_uart_write(uint8_t *data, size_t len) {
+    if (!is_connected || tx_char_handle == 0) {
+        LOG_ERROR(TAG, "❌ BLE not connected or TX characteristic not found");
+        return ESP_FAIL;
     }
     
-    // Always restart discovery if direct connection failed
-    ESP_LOGI(TAG, "🔍 Restarting device discovery...");
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    start_device_discovery();
+    LOG_BT(TAG, "⬆️ SEND (%d bytes): %.*s", len, (int)len, (char *)data);
+    
+    return esp_ble_gattc_write_char(gattc_if, conn_id, tx_char_handle,
+                                   len, data, ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NONE);
 }
 
-// Start device discovery with timeout protection
-void start_device_discovery(void) {
-    if (is_connecting || is_connected) {
-        ESP_LOGD(TAG, "🔗 Already connecting/connected, skipping discovery");
+// Start BLE scanning
+void start_ble_scan(void) {
+    if (is_scanning) {
+        ESP_LOGD(TAG, "🔍 BLE scan already in progress");
         return;
     }
     
-    is_searching = true;
-    ESP_LOGI(TAG, "🔍 Starting device discovery for ELM327...");
-    esp_err_t ret = esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 10, 0);
-    if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "✅ Device discovery started successfully");
-        // LED search indicator handled automatically by bluetooth_led_task
-        ESP_LOGI(TAG, "🔍 Device discovery started - looking for ELM327...");
-        
-        // Create timeout protection task - restart discovery if it takes too long
-        xTaskCreate(discovery_timeout_task, "discovery_timeout", 2048, NULL, 3, NULL);
-        
-    } else {
-        ESP_LOGE(TAG, "❌ Failed to start device discovery: %s", esp_err_to_name(ret));
-        is_searching = false;
-        
-        // Retry discovery after delay
-        xTaskCreate(restart_discovery_task, "retry_discovery", 2048, NULL, 3, NULL);
+    LOG_BT(TAG, "🔍 Starting BLE scan for ELM327...");
+    
+    esp_ble_scan_params_t scan_params = {
+        .scan_type = BLE_SCAN_TYPE_ACTIVE,
+        .own_addr_type = BLE_ADDR_TYPE_PUBLIC,
+        .scan_filter_policy = BLE_SCAN_FILTER_ALLOW_ALL,
+        .scan_interval = 0x50,  // 50ms
+        .scan_window = 0x30,    // 30ms
+        .scan_duplicate = BLE_SCAN_DUPLICATE_DISABLE
+    };
+    
+    esp_err_t ret = esp_ble_gap_set_scan_params(&scan_params);
+    if (ret != ESP_OK) {
+        LOG_ERROR(TAG, "❌ Failed to set scan parameters: %s", esp_err_to_name(ret));
+        return;
+    }
+    
+    ret = esp_ble_gap_start_scanning(30);  // Scan for 30 seconds
+    if (ret != ESP_OK) {
+        LOG_ERROR(TAG, "❌ Failed to start scanning: %s", esp_err_to_name(ret));
     }
 }
 
 // Initialize Bluetooth system
 void bluetooth_init(void) {
-    LOG_INFO(TAG, "Starting Bluetooth initialization...");
+    LOG_BT(TAG, "🚀 Initializing BLE system...");
     
-    // Release BLE memory since we only use Classic BT
-    LOG_VERBOSE(TAG, "Releasing BLE memory (using Classic BT only)...");
-    esp_err_t ret = esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
-    if (ret != ESP_OK) {
-        LOG_ERROR(TAG, "Failed to release BLE memory: %s", esp_err_to_name(ret));
-        return;
+    // Initialize NVS
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
     }
+    ESP_ERROR_CHECK(ret);
     
-    // Initialize BT controller in Classic mode only
-    LOG_VERBOSE(TAG, "Initializing BT controller (Classic mode)...");
+    // Initialize Bluetooth controller
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-    bt_cfg.mode = ESP_BT_MODE_CLASSIC_BT;  // Classic Bluetooth only
     ret = esp_bt_controller_init(&bt_cfg);
     if (ret != ESP_OK) {
-        LOG_ERROR(TAG, "BT controller init failed: %s", esp_err_to_name(ret));
+        LOG_ERROR(TAG, "❌ Failed to initialize BT controller: %s", esp_err_to_name(ret));
         return;
     }
     
-    // Enable BT controller
-    LOG_VERBOSE(TAG, "Enabling BT controller (Classic Bluetooth only)...");
-    ret = esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT);
+    ret = esp_bt_controller_enable(ESP_BT_MODE_BLE);
     if (ret != ESP_OK) {
-        LOG_ERROR(TAG, "BT controller enable failed: %s", esp_err_to_name(ret));
+        LOG_ERROR(TAG, "❌ Failed to enable BT controller: %s", esp_err_to_name(ret));
         return;
     }
     
     // Initialize Bluedroid
-    LOG_VERBOSE(TAG, "Initializing Bluedroid...");
     ret = esp_bluedroid_init();
     if (ret != ESP_OK) {
-        LOG_ERROR(TAG, "Bluedroid init failed: %s", esp_err_to_name(ret));
+        LOG_ERROR(TAG, "❌ Failed to init bluedroid: %s", esp_err_to_name(ret));
         return;
     }
     
-    // Enable Bluedroid
-    LOG_VERBOSE(TAG, "Enabling Bluedroid...");
     ret = esp_bluedroid_enable();
     if (ret != ESP_OK) {
-        LOG_ERROR(TAG, "Bluedroid enable failed: %s", esp_err_to_name(ret));
+        LOG_ERROR(TAG, "❌ Failed to enable bluedroid: %s", esp_err_to_name(ret));
         return;
     }
     
-    // Configure ESP-IDF Bluetooth stack logging
-    configure_esp_bt_logging();
-    
-    // Log free heap before SPP init
-    LOG_DEBUG(TAG, "Free heap before SPP: %lu bytes", esp_get_free_heap_size());
-    
-    // Initialize SPP (Serial Port Profile)
-    LOG_VERBOSE(TAG, "Initializing SPP (Serial Port Profile)...");
-    ret = esp_spp_init(ESP_SPP_MODE_CB);
+    // Register GAP callback
+    ret = esp_ble_gap_register_callback(gap_callback);
     if (ret != ESP_OK) {
-        LOG_ERROR(TAG, "SPP init failed: %s", esp_err_to_name(ret));
+        LOG_ERROR(TAG, "❌ Failed to register GAP callback: %s", esp_err_to_name(ret));
         return;
     }
     
-    // Register SPP callback
-    LOG_VERBOSE(TAG, "Registering SPP callback...");
-    ret = esp_spp_register_callback(spp_callback);
+    // Register GATT client
+    ret = esp_ble_gattc_register_callback(gattc_callback);
     if (ret != ESP_OK) {
-        LOG_ERROR(TAG, "SPP callback register failed: %s", esp_err_to_name(ret));
+        LOG_ERROR(TAG, "❌ Failed to register GATT client callback: %s", esp_err_to_name(ret));
         return;
     }
     
-    // Register GAP callback for device discovery
-    LOG_VERBOSE(TAG, "Registering GAP callback...");
-    ret = esp_bt_gap_register_callback(gap_callback);
+    ret = esp_ble_gattc_app_register(0);
     if (ret != ESP_OK) {
-        LOG_ERROR(TAG, "GAP callback register failed: %s", esp_err_to_name(ret));
+        LOG_ERROR(TAG, "❌ Failed to register GATT client app: %s", esp_err_to_name(ret));
         return;
     }
     
-    LOG_INFO(TAG, "Bluetooth initialization complete!");
+    LOG_BT(TAG, "✅ BLE initialization complete");
     
-    // Start the global reconnection watchdog
-    xTaskCreate(reconnection_watchdog_task, "bt_watchdog", 2048, NULL, 2, NULL);
-} 
+    // Start reconnection watchdog
+    xTaskCreate(reconnection_watchdog_task, "reconnect_watchdog", 4096, NULL, 2, NULL);
+}
 
-// Task to restart discovery after a delay (infinite reconnection)
-void restart_discovery_task(void *pvParameters) {
+// Handle connection failure
+void handle_connection_failure(void) {
+    connection_attempt++;
+    LOG_WARN(TAG, "🔴 Connection attempt %d failed", connection_attempt);
+    
+    // Wait before retrying
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    
+    if (!is_connected) {
+        start_ble_scan();
+    }
+}
+
+// Task to restart scanning after timeout
+void restart_scan_task(void *pvParameters) {
     vTaskDelay(pdMS_TO_TICKS(5000));  // Wait 5 seconds
     
-    // Only restart if still disconnected
     if (!is_connected && !is_connecting) {
-        ESP_LOGI(TAG, "🔄 Restarting discovery after timeout...");
-        start_device_discovery();
-    } else {
-        ESP_LOGD(TAG, "🎯 Connected during delay - skipping discovery restart");
+        LOG_INFO(TAG, "🔄 Restarting BLE scan...");
+        start_ble_scan();
     }
     
     vTaskDelete(NULL);
-} 
+}
 
-// Task to restart discovery after a delay (infinite reconnection)
-void discovery_timeout_task(void *pvParameters) {
-    vTaskDelay(pdMS_TO_TICKS(15000));  // Wait 15 seconds max
+// Task to handle scan timeout
+void scan_timeout_task(void *pvParameters) {
+    vTaskDelay(pdMS_TO_TICKS(30000));  // Wait 30 seconds (scan duration)
     
-    if (is_searching && !is_connected && !is_connecting) {
-        ESP_LOGW(TAG, "⏰ Discovery timeout - forcing restart");
-        esp_bt_gap_cancel_discovery();
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        start_device_discovery();
+    if (is_scanning && !is_connecting) {
+        LOG_WARN(TAG, "⏰ Scan timeout - stopping scan");
+        esp_ble_gap_stop_scanning();
     }
     
     vTaskDelete(NULL);
-} 
+}
 
-// Global reconnection watchdog - ensures we NEVER stop trying to reconnect
+// Reconnection watchdog task
 void reconnection_watchdog_task(void *pvParameters) {
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(30000));  // Check every 30 seconds
+        vTaskDelay(pdMS_TO_TICKS(10000));  // Check every 10 seconds
         
-        // If disconnected and not actively trying to reconnect, force reconnection
-        if (!is_connected && !is_connecting && !is_searching) {
-            ESP_LOGW(TAG, "🚨 Reconnection watchdog triggered - forcing reconnection attempt");
-            connection_attempt = 0;  // Reset retry counter
-            handle_connection_failure();
+        if (!is_connected && !is_connecting && !is_scanning) {
+            LOG_INFO(TAG, "🔄 Watchdog: Attempting reconnection...");
+            start_ble_scan();
         }
     }
 } 
