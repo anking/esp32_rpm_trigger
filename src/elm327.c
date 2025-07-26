@@ -430,7 +430,7 @@ void initialize_elm327(void) {
     memset(rx_buffer, 0, RX_BUFFER_SIZE);
     rx_buffer_len = 0;
     
-    vTaskDelay(pdMS_TO_TICKS(3000));
+    vTaskDelay(pdMS_TO_TICKS(1000));  // Reduced from 3000ms
     
     esp_err_t ret = elm327_send_command("ATZ");
     if (ret != ESP_OK) {
@@ -439,7 +439,7 @@ void initialize_elm327(void) {
         return;
     }
     
-    vTaskDelay(pdMS_TO_TICKS(3000));
+    vTaskDelay(pdMS_TO_TICKS(1000));  // Reduced from 3000ms
     
     ret = elm327_send_command("ATE0");
     if (ret != ESP_OK) {
@@ -447,7 +447,7 @@ void initialize_elm327(void) {
         initialization_in_progress = false;
         return;
     }
-    vTaskDelay(pdMS_TO_TICKS(500));
+    vTaskDelay(pdMS_TO_TICKS(200));  // Reduced from 500ms
     
     // Send initialization commands
     const char *init_cmds[] = {
@@ -457,22 +457,22 @@ void initialize_elm327(void) {
     
     for (size_t i = 0; i < sizeof(init_cmds)/sizeof(init_cmds[0]); i++) {
         elm327_send_command(init_cmds[i]);
-        vTaskDelay(pdMS_TO_TICKS(500));
+        vTaskDelay(pdMS_TO_TICKS(200));  // Reduced from 500ms
     }
     
     // Try specific protocols
     elm327_send_command("AT SP 6");
-    vTaskDelay(pdMS_TO_TICKS(500));
+    vTaskDelay(pdMS_TO_TICKS(200));  // Reduced from 500ms
     elm327_send_command("0100");
-    vTaskDelay(pdMS_TO_TICKS(3000));
+    vTaskDelay(pdMS_TO_TICKS(1000));  // Reduced from 3000ms
     
     elm327_send_command("AT SP 7");
-    vTaskDelay(pdMS_TO_TICKS(500));
+    vTaskDelay(pdMS_TO_TICKS(200));  // Reduced from 500ms
     elm327_send_command("0100");
-    vTaskDelay(pdMS_TO_TICKS(3000));
+    vTaskDelay(pdMS_TO_TICKS(1000));  // Reduced from 3000ms
     
     elm327_send_command("AT SP 0");
-    vTaskDelay(pdMS_TO_TICKS(500));
+    vTaskDelay(pdMS_TO_TICKS(200));  // Reduced from 500ms
     
     elm327_initialized = true;
     elm_ready = true;
@@ -495,9 +495,9 @@ void initialize_elm327_task(void *pv) {
     LOG_INFO(TAG, "🚀 === ELM327 INITIALIZATION START ===");
     LOG_INFO(TAG, "📋 VEEPEAK should be responsive after disable/enable sequence");
     
-    // Additional stabilization after notification re-enable (matching nRF Connect timing)
-    LOG_INFO(TAG, "⏱️ Waiting 5 seconds for VEEPEAK to stabilize after notification reset...");
-    vTaskDelay(pdMS_TO_TICKS(5000));
+    // Additional stabilization after notification re-enable
+    LOG_INFO(TAG, "⏱️ Waiting for VEEPEAK to stabilize after notification reset...");
+    vTaskDelay(pdMS_TO_TICKS(1000));  // Reduced from 5000ms
     
     // Test standard command formats (should work after disable/enable sequence)
     LOG_INFO(TAG, "🔄 Phase 1: Testing ATZ commands (post-CCCD reset)...");
