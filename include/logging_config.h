@@ -2,12 +2,12 @@
 #define LOGGING_CONFIG_H
 
 // Logging control flags - Set to 1 to enable, 0 to disable
-#define ENABLE_VERBOSE_LOGGING    0  // Detailed status messages
-#define ENABLE_DEBUG_LOGGING      0  // Debug and trace messages  
-#define ENABLE_EMOJI_LOGGING      0  // Emoji-decorated messages
-#define ENABLE_BLUETOOTH_LOGGING  0  // Detailed Bluetooth protocol logs
-#define ENABLE_ELM327_LOGGING     0  // Detailed ELM327 communication logs
-#define ENABLE_ESP_BT_LOGS        0  // ESP-IDF Bluetooth stack logs (BT_RFCOMM, BT_L2CAP, etc.)
+#define ENABLE_VERBOSE_LOGGING    0  // Detailed status messages (DISABLED - STACK OVERFLOW FIX)
+#define ENABLE_DEBUG_LOGGING      0  // Debug and trace messages (DISABLED - STACK OVERFLOW FIX)
+#define ENABLE_EMOJI_LOGGING      1  // Emoji-decorated messages (ENABLED FOR ELM327 DEBUGGING)
+#define ENABLE_BLUETOOTH_LOGGING  1  // Detailed Bluetooth protocol logs
+#define ENABLE_ELM327_LOGGING     1  // Detailed ELM327 communication logs
+#define ENABLE_ESP_BT_LOGS        0  // ESP-IDF Bluetooth stack logs (DISABLED - STACK OVERFLOW FIX)
 
 // Conditional logging macros
 #if ENABLE_VERBOSE_LOGGING

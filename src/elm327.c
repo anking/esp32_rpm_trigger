@@ -116,13 +116,14 @@ void elm327_handle_response(const char *response) {
     
     ESP_LOGI(TAG, "⬇️ RECV: %s", response);
     
+    // Always set the response received flag first
+    response_received_flag = true;
+    
     // Check for common ELM327 responses
     if (strstr(response, "ELM327")) {
         ESP_LOGI(TAG, "🔧 ELM327 device identified: %s", response);
-        response_received_flag = true;  // Signal response received
     } else if (strstr(response, "OK")) {
         ESP_LOGD(TAG, "✅ Command acknowledged");
-        response_received_flag = true;  // Signal response received
     } else if (strstr(response, "CAN ERROR") || strstr(response, "NO DATA")) {
         ESP_LOGW(TAG, "⚠️ CAN/ECU error: %s", response);
         
@@ -139,13 +140,11 @@ void elm327_handle_response(const char *response) {
         
         // Check for ECU disconnection
         check_ecu_disconnection();
-        response_received_flag = true;  // Signal error response received
         return;
     } else if (strstr(response, "ERROR")) {
         ESP_LOGW(TAG, "⚠️ ELM327 error: %s", response);
         consecutive_ecu_failures++;
         check_ecu_disconnection();
-        response_received_flag = true;  // Signal error response received
     } else if (strstr(response, "UNABLE TO CONNECT")) {
         ESP_LOGD(TAG, "🔌 ELM327 cannot connect to ECU");
         
@@ -155,10 +154,8 @@ void elm327_handle_response(const char *response) {
         
         // Check for ECU disconnection
         check_ecu_disconnection();
-        response_received_flag = true;  // Signal error response received
     } else if (strstr(response, "SEARCHING")) {
         ESP_LOGD(TAG, "🔍 ELM327 searching for ECU...");
-        response_received_flag = true;  // Signal response received
     } else {
         // Successfully received some response - reset basic failure counter
         consecutive_fail = 0;
@@ -171,9 +168,6 @@ void elm327_handle_response(const char *response) {
         
         // Process as potential OBD data
         process_obd_response(response);
-        
-        // Signal response received AFTER data processing is complete
-        response_received_flag = true;
     }
 }
 
@@ -435,7 +429,7 @@ void initialize_elm327(void) {
     initialization_in_progress = true;
     
     ESP_LOGI(TAG, "🚀 === ELM327 INITIALIZATION SEQUENCE START ===");
-    ESP_LOGI(TAG, "🔧 Configuring ELM327 for Honda Civic (ISO 15765-4, 29-bit, 500k)");
+    ESP_LOGI(TAG, "🔧 Configuring ELM327 for universal vehicle compatibility (Auto-detect protocol)");
     
     // Wait for ELM327 to settle after connection
     ESP_LOGI(TAG, "⏱️ Step 1: Waiting 3 seconds for ELM327 to settle...");
@@ -454,7 +448,7 @@ void initialize_elm327(void) {
     ESP_LOGI(TAG, "⏱️ Step 3: Waiting for reset to complete...");
     vTaskDelay(pdMS_TO_TICKS(3000));
     
-    // Configure ELM327 for Honda Civic (ISO 15765-4 29-bit, 500k)
+    // Configure ELM327 with universal settings (auto-detect protocol)
     ESP_LOGI(TAG, "⚙️ Step 4: Configuring ELM327 parameters...");
     
     // Turn off echo
@@ -467,9 +461,14 @@ void initialize_elm327(void) {
     }
     vTaskDelay(pdMS_TO_TICKS(500));
     
-    // Try automatic protocol detection first
+    // Try automatic protocol detection first (works with most vehicles)
     ESP_LOGI(TAG, "├─ Setting auto protocol detection...");
     elm327_send_command("AT SP 0");
+    vTaskDelay(pdMS_TO_TICKS(500));
+    
+    // Reset all filters to ensure clean communication
+    ESP_LOGI(TAG, "├─ Resetting all filters...");
+    elm327_send_command("AT CRA");
     vTaskDelay(pdMS_TO_TICKS(500));
     
     // Allow long frames (>7 bytes)
@@ -510,12 +509,35 @@ void initialize_elm327(void) {
     // Try a basic OBD test
     ESP_LOGI(TAG, "├─ Testing basic OBD...");
     elm327_send_command("0100");
-    vTaskDelay(pdMS_TO_TICKS(2000));
+    vTaskDelay(pdMS_TO_TICKS(4000));  // Longer wait for first OBD command
     
-    ESP_LOGI(TAG, "If above shows CAN ERROR, check:");
+    // If no response, try specific protocols for different vehicles
+    ESP_LOGI(TAG, "├─ Testing protocol-specific configurations...");
+    
+    // Try ISO 15765-4 CAN (11 bit ID, 500 kbaud) - common for Audi/VW
+    ESP_LOGI(TAG, "├─ Trying Audi/VW protocol (ISO 15765-4, 11-bit)...");
+    elm327_send_command("AT SP 6");
+    vTaskDelay(pdMS_TO_TICKS(500));
+    elm327_send_command("0100");
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    
+    // Try ISO 15765-4 CAN (29 bit ID, 500 kbaud) - alternative for some Audis
+    ESP_LOGI(TAG, "├─ Trying alternative CAN protocol (29-bit)...");
+    elm327_send_command("AT SP 7");
+    vTaskDelay(pdMS_TO_TICKS(500));
+    elm327_send_command("0100");
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    
+    // Reset back to auto-detect for normal operation
+    ESP_LOGI(TAG, "├─ Resetting to auto-detect for normal operation...");
+    elm327_send_command("AT SP 0");
+    vTaskDelay(pdMS_TO_TICKS(500));
+    
+    ESP_LOGI(TAG, "If above shows CAN ERROR or NO DATA, check:");
     ESP_LOGI(TAG, "1. Car ignition is ON");
-    ESP_LOGI(TAG, "2. Car engine is running");
+    ESP_LOGI(TAG, "2. Car engine is running"); 
     ESP_LOGI(TAG, "3. OBD port connection is secure");
+    ESP_LOGI(TAG, "4. Vehicle is OBD-II compliant (1996+ for US, 2001+ for EU)");
     
     // Mark as initialized
     elm327_initialized = true;
@@ -533,10 +555,173 @@ void initialize_elm327(void) {
 // ELM327 initialization task (runs in separate thread)
 void initialize_elm327_task(void *pv) {
     LOG_ELM(TAG, "ELM327 initialization task started...");
+    LOG_INFO(TAG, "🚀 === ELM327 INITIALIZATION SEQUENCE START ===");
     
-    // Perform gentle initialization
-    initialize_elm327();
+    // Wait for BLE connection to stabilize
+    LOG_INFO(TAG, "⏱️ Waiting 5 seconds for BLE connection to stabilize...");
+    vTaskDelay(pdMS_TO_TICKS(5000));
+    
+    // Test different command formats
+    LOG_INFO(TAG, "🔄 Phase 1: Testing basic communication with ATZ...");
+    
+    const char *cmd_formats[] = {"ATZ\r\n", "ATZ\r", "ATZ\n"};
+    const uint8_t max_retries = 3;
+    bool response_received = false;
+    
+    for (size_t fmt_idx = 0; fmt_idx < sizeof(cmd_formats)/sizeof(cmd_formats[0]) && !response_received; fmt_idx++) {
+        const char *cmd = cmd_formats[fmt_idx];
+        LOG_INFO(TAG, "🔍 Testing command format %zu/3: %s", fmt_idx + 1, 
+                fmt_idx == 0 ? "ATZ\\r\\n" : (fmt_idx == 1 ? "ATZ\\r" : "ATZ\\n"));
+        
+        for (uint8_t retry = 0; retry < max_retries && !response_received; retry++) {
+            LOG_INFO(TAG, "🔄 Sending command (attempt %d/%d)...", retry + 1, max_retries);
+            
+            // Clear response flag before sending
+            response_received_flag = false;
+            elm_ready = false;
+            
+            esp_err_t ret = ble_uart_write((uint8_t *)cmd, strlen(cmd));
+            if (ret != ESP_OK) {
+                LOG_ERROR(TAG, "❌ Failed to send command: %s", esp_err_to_name(ret));
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                continue;
+            }
+            
+            LOG_INFO(TAG, "✅ Command sent, waiting for response...");
+            
+            // Wait for response (up to 10 seconds per attempt)
+            TickType_t start_time = xTaskGetTickCount();
+            TickType_t timeout = pdMS_TO_TICKS(10000);  // 10 second timeout per attempt
+            
+            while (xTaskGetTickCount() - start_time < timeout) {
+                if (response_received_flag) {
+                    response_received = true;
+                    LOG_INFO(TAG, "✅ Response received! Command format: %s", 
+                            fmt_idx == 0 ? "\\r\\n" : (fmt_idx == 1 ? "\\r" : "\\n"));
+                    break;
+                }
+                vTaskDelay(pdMS_TO_TICKS(100));  // Check every 100ms
+            }
+            
+            if (!response_received && retry < max_retries - 1) {
+                LOG_WARN(TAG, "⚠️ No response to command, retrying...");
+                vTaskDelay(pdMS_TO_TICKS(1000));  // Wait 1 second before retry
+            }
+        }
+        
+        if (!response_received) {
+            LOG_WARN(TAG, "⚠️ No response with format: %s", 
+                    fmt_idx == 0 ? "\\r\\n" : (fmt_idx == 1 ? "\\r" : "\\n"));
+        }
+    }
+    
+    // Try alternative commands if ATZ failed
+    if (!response_received) {
+        LOG_WARN(TAG, "⚠️ ATZ failed with all formats, trying alternative commands...");
+        const char *alt_cmds[] = {"ATI\r", "ATI\r\n", "AT@1\r", "AT@1\r\n"};
+        
+        for (size_t i = 0; i < sizeof(alt_cmds)/sizeof(alt_cmds[0]) && !response_received; i++) {
+            LOG_INFO(TAG, "🔄 Sending alternative command: %s", alt_cmds[i]);
+            
+            response_received_flag = false;
+            esp_err_t ret = ble_uart_write((uint8_t *)alt_cmds[i], strlen(alt_cmds[i]));
+            if (ret == ESP_OK) {
+                TickType_t start_time = xTaskGetTickCount();
+                while (!response_received_flag && (xTaskGetTickCount() - start_time < pdMS_TO_TICKS(10000))) {
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                }
+                if (response_received_flag) {
+                    response_received = true;
+                    LOG_INFO(TAG, "✅ Response received to alternative command: %s", alt_cmds[i]);
+                }
+            }
+        }
+    }
+    
+    if (!response_received) {
+        LOG_ERROR(TAG, "❌ Failed to get response after all attempts (ATZ + alternatives)");
+        LOG_ERROR(TAG, "💡 This indicates a communication problem:");
+        LOG_ERROR(TAG, "   - VEEPEAK device may not be sending notifications");
+        LOG_ERROR(TAG, "   - BLE GATT notifications may not be working"); 
+        LOG_ERROR(TAG, "   - Device may require different initialization sequence");
+        LOG_ERROR(TAG, "   - Vehicle OBD-II port may be inactive (ignition off, engine not running)");
+        LOG_ERROR(TAG, "   - OBD-II connector may be loose or faulty");
+        LOG_ERROR(TAG, "   - VEEPEAK firmware may be incompatible with this approach");
+        goto initialization_failed;
+    }
+    
+    // If we got a response, continue with full initialization
+    LOG_INFO(TAG, "🎉 SUCCESS! Basic communication verified - proceeding with full initialization");
+    
+    // Send comprehensive initialization commands
+    LOG_INFO(TAG, "🔧 Phase 2: Sending complete ELM327 initialization sequence...");
+    
+    const char *init_cmds[] = {
+        "ATE0\r",       // Turn off echo
+        "AT SP 0\r",    // Auto protocol detection
+        "AT CRA\r",     // Reset all filters
+        "AT AL\r",      // Allow long frames
+        "AT SH 7DF\r",  // Set broadcast address
+        "AT CAF1\r",    // Enable auto-format ISO-TP
+        "AT ST 32\r",   // Set shorter timeout (50ms)
+        "ATH0\r",       // Headers off
+        "AT RV\r",      // Read voltage (test command)
+        "AT DPN\r",     // Check detected protocol
+        "0100\r"        // Basic OBD test - get supported PIDs
+    };
+    
+    const char *cmd_descriptions[] = {
+        "Disabling echo", "Setting auto protocol", "Resetting filters", "Enabling long frames",
+        "Setting broadcast address", "Enabling auto-format", "Setting timeout", "Disabling headers",
+        "Reading voltage", "Checking protocol", "Testing OBD (supported PIDs)"
+    };
+    
+    for (size_t i = 0; i < sizeof(init_cmds)/sizeof(init_cmds[0]); i++) {
+        LOG_INFO(TAG, "├─ %s (%s)...", cmd_descriptions[i], init_cmds[i]);
+        response_received_flag = false;
+        
+        esp_err_t ret = ble_uart_write((uint8_t *)init_cmds[i], strlen(init_cmds[i]));
+        if (ret == ESP_OK) {
+            // Wait for response with longer timeout for OBD commands
+            uint32_t timeout_ms = (i >= 9) ? 5000 : 2000;  // 5s for OBD commands, 2s for AT commands
+            TickType_t start_time = xTaskGetTickCount();
+            
+            while (!response_received_flag && (xTaskGetTickCount() - start_time < pdMS_TO_TICKS(timeout_ms))) {
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
+            
+            if (response_received_flag) {
+                LOG_INFO(TAG, "├─ ✅ Response received");
+            } else {
+                LOG_WARN(TAG, "├─ ⚠️ No response, but continuing...");
+            }
+        } else {
+            LOG_ERROR(TAG, "├─ ❌ Failed to send command: %s", esp_err_to_name(ret));
+        }
+        
+        // Small delay between commands
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+    
+    // Mark as initialized
+    elm327_initialized = true;
+    elm_ready = true;
+    set_ecu_status(true);
+    initialization_in_progress = false;
+    LOG_INFO(TAG, "✅ === ELM327 INITIALIZATION COMPLETE ===");
+    
+    // Signal that ELM327 is ready
+    xSemaphoreGive(connection_semaphore);
+    
+    // Now verify connection to vehicle ECU
+    verify_ecu_connection();
     
     // Delete this task when done
+    vTaskDelete(NULL);
+    
+initialization_failed:
+    LOG_ERROR(TAG, "❌ ELM327 initialization failed");
+    initialization_in_progress = false;  // Clear flag on failure
+    elm327_initialized = false;
     vTaskDelete(NULL);
 } 
