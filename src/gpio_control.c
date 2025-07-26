@@ -200,7 +200,7 @@ void trigger_led_burst(void) {
               auto_injection_mode ? "ENABLED" : "DISABLED");
     
     for (int i = 0; i < 3; i++) {
-        set_rgb_led(255, 0, 0); // Red for burst
+        set_rgb_led(255, 255, 0); // Yellow for mode toggle (red + green)
         vTaskDelay(pdMS_TO_TICKS(100));  // 100ms on
         set_rgb_led(0, 0, 0);
         vTaskDelay(pdMS_TO_TICKS(100));  // 100ms off
@@ -325,36 +325,36 @@ void bluetooth_led_task(void *pv) {
         }
         
         if (is_connected && ecu_connected) {
-            // Both BT and ECU connected
+            // Both BT and ECU connected - SOLID GREEN
             if (auto_injection_mode) {
-                // Auto injection mode: Blink (off for 200ms every 1s)
-                set_rgb_led(255, 0, 0); // Red for auto injection mode
+                // Auto injection mode: Solid green interrupted by 200ms OFF every second
+                set_rgb_led(0, 255, 0);  // Green solid
                 vTaskDelay(pdMS_TO_TICKS(800));   // On for 800ms
-                set_rgb_led(0, 0, 0);
-                vTaskDelay(pdMS_TO_TICKS(200));   // Off for 200ms (blink)
+                set_rgb_led(0, 0, 0);    // Off for 200ms interrupt
+                vTaskDelay(pdMS_TO_TICKS(200));   
             } else {
-                // Normal mode: Solid ON
-                set_rgb_led(255, 255, 255); // White for normal mode
+                // Normal mode: Solid green
+                set_rgb_led(0, 255, 0);  // Solid green
                 vTaskDelay(pdMS_TO_TICKS(1000));  // Check every second
             }
             
         } else if (is_connected && !ecu_connected) {
-            // Fast flash - BT connected, ECU connecting/searching
-            set_rgb_led(255, 0, 0); // Red for fast flash
-            vTaskDelay(pdMS_TO_TICKS(100));   // On for 100ms
-            set_rgb_led(0, 0, 0);
-            vTaskDelay(pdMS_TO_TICKS(150));   // Off for 150ms (250ms cycle = fast)
+            // BT connected, ECU connecting - BLINK GREEN
+            set_rgb_led(0, 255, 0);  // Green blink for ECU connecting
+            vTaskDelay(pdMS_TO_TICKS(500));   // On for 500ms
+            set_rgb_led(0, 0, 0);    // Off
+            vTaskDelay(pdMS_TO_TICKS(500));   // Off for 500ms (1s cycle)
             
         } else if (is_scanning || is_connecting) {
-            // Slow flash - BT connecting/searching
-            set_rgb_led(255, 0, 0); // Red for slow flash
-            vTaskDelay(pdMS_TO_TICKS(300));   // On for 300ms
-            set_rgb_led(0, 0, 0);
-            vTaskDelay(pdMS_TO_TICKS(700));   // Off for 700ms (1000ms cycle = slow)
+            // BT connecting/scanning - BLINK BLUE
+            set_rgb_led(0, 0, 255);  // Blue blink for BT connecting
+            vTaskDelay(pdMS_TO_TICKS(500));   // On for 500ms
+            set_rgb_led(0, 0, 0);    // Off
+            vTaskDelay(pdMS_TO_TICKS(500));   // Off for 500ms (1s cycle)
             
         } else {
             // OFF - nothing connected
-            set_rgb_led(0, 0, 0);
+            set_rgb_led(0, 0, 0);    // LED off
             vTaskDelay(pdMS_TO_TICKS(500));   // Check every 500ms
         }
     }
@@ -367,8 +367,8 @@ void set_rgb_led(uint8_t red, uint8_t green, uint8_t blue) {
         return;
     }
     
-    // WS2812 expects GRB format, not RGB
-    uint32_t color = (green << 16) | (red << 8) | blue;
+    // WS2812 expects GRB format, but swapping red/green to fix color issue
+    uint32_t color = (red << 16) | (green << 8) | blue;
     
     rmt_item32_t data[24];  // 24 bits for one LED (8 bits each for G, R, B)
     
