@@ -6,6 +6,8 @@
 #include "logging_config.h"
 #include "bluetooth.h"
 #include "bt_test_stub.h"
+#include "elm327.h"           // FIXED: Added for elm327_init_system()
+#include "gpio_control.h"     // FIXED: Added for gpio_init_system()
 
 static const char *TAG = "BT_TEST";
 
@@ -28,6 +30,16 @@ void run_bt_connection_test(void) {
 
     // Configure stack logging (use same helper as full app)
     configure_esp_bt_logging();
+
+    // FIXED: Initialize ELM327 system to create semaphores (prevents NULL semaphore crash)
+    ESP_LOGI(TAG, "TEST STUB: Step 3 - Initializing ELM327 system");
+    elm327_init_system();
+    ESP_LOGI(TAG, "TEST STUB: ELM327 system initialized - semaphores created");
+
+    // FIXED: Initialize GPIO system to prevent crashes in set_ecu_status()
+    ESP_LOGI(TAG, "TEST STUB: Step 4 - Initializing GPIO system");
+    gpio_init_system();
+    ESP_LOGI(TAG, "TEST STUB: GPIO system initialized");
 
     // Bring up Bluetooth controller / host and begin scanning
     ESP_LOGI(TAG, "TEST STUB: Step 5 - Calling bluetooth_init()");

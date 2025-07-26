@@ -23,6 +23,7 @@ uint16_t conn_id = 0xFFFF;  // Sentinel value for no connection
 
 // Target ELM327 device address (VEEPEAK BLE ELM327)
 esp_bd_addr_t target_elm327_addr = {0x66, 0x1E, 0x87, 0x02, 0x64, 0xC1};  // VEEPEAK ELM327
+esp_bd_addr_t peer_bda;  // Store connected peer address for register_for_notify
 
 // GATT handles for UART service
 uint16_t uart_service_handle = 0;
@@ -32,6 +33,15 @@ uint16_t rx_char_cccd_handle = 0;
 
 // Service discovery globals
 static uint16_t svc_start = 0, svc_end = 0;
+
+// CCCD state tracking for VEEPEAK disable/enable sequence
+typedef enum {
+    CCCD_STATE_INITIAL_ENABLE,
+    CCCD_STATE_DISABLING,
+    CCCD_STATE_ENABLING
+} cccd_state_t;
+
+static cccd_state_t cccd_state = CCCD_STATE_INITIAL_ENABLE;
 
 // Nordic UART Service UUIDs (not used - using direct handles instead)
 // static esp_bt_uuid_t uart_service_uuid = {
@@ -177,6 +187,10 @@ static void gattc_callback(esp_gattc_cb_event_t event, esp_gatt_if_t gatt_if, es
             is_connecting = false;  // ✅ Clear connecting state
             is_connected = true;    // ✅ Set connected state
             
+            // Store peer address for register_for_notify (CRITICAL FIX)
+            memcpy(peer_bda, param->connect.remote_bda, ESP_BD_ADDR_LEN);
+            LOG_INFO(TAG, "📍 Stored peer address for notification registration");
+            
             LOG_BT(TAG, "✅ Connected to ELM327 BLE device (conn_id: %d)", conn_id);
             LOG_INFO(TAG, "🎉 VEEPEAK BLE connection successful!");
             
@@ -253,7 +267,8 @@ static void gattc_callback(esp_gattc_cb_event_t event, esp_gatt_if_t gatt_if, es
                 vTaskDelay(pdMS_TO_TICKS(30000));
             }
             
-            xTaskCreate(reconnection_watchdog_task, "reconnect_watchdog", 4096, NULL, 2, NULL);
+            // FIXED: Increased stack size from 4096 to 6144 for BLE operations
+            xTaskCreate(reconnection_watchdog_task, "reconnect_watchdog", 6144, NULL, 2, NULL);
             break;
             
         case ESP_GATTC_SEARCH_RES_EVT: {
@@ -262,12 +277,21 @@ static void gattc_callback(esp_gattc_cb_event_t event, esp_gatt_if_t gatt_if, es
             esp_bt_uuid_t *uuid = &param->search_res.srvc_id.uuid;
             
             if (uuid->len == ESP_UUID_LEN_128) {
-                // Nordic UART Service: 49535343-FE7D-4AE5-8FA9-9FAFD205E455
-                uint8_t nordic_uuid[16] = {0x55,0xE4,0x05,0xD2,0xAF,0x9F,0xA9,0x8F,
-                                          0xE5,0x4A,0x7D,0xFE,0x43,0x53,0x53,0x49};
-                if (memcmp(uuid->uuid.uuid128, nordic_uuid, 16) == 0) {
+                // VEEPEAK UART Service: 0000fff0-0000-1000-8000-00805f9b34fb (CONFIRMED BY nRF CONNECT)
+                uint8_t veepeak_uuid[16] = {0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80,
+                                           0x00, 0x10, 0x00, 0x00, 0xf0, 0xff, 0x00, 0x00};
+                if (memcmp(uuid->uuid.uuid128, veepeak_uuid, 16) == 0) {
                     is_uart_service = true;
-                    LOG_INFO(TAG, "📌 Found Nordic UART Service (128-bit)");
+                    LOG_INFO(TAG, "🎉 Found VEEPEAK UART Service (128-bit fff0) - CORRECT UUID!");
+                }
+                // Nordic UART Service: 49535343-FE7D-4AE5-8FA9-9FAFD205E455
+                else {
+                    uint8_t nordic_uuid[16] = {0x55,0xE4,0x05,0xD2,0xAF,0x9F,0xA9,0x8F,
+                                              0xE5,0x4A,0x7D,0xFE,0x43,0x53,0x53,0x49};
+                    if (memcmp(uuid->uuid.uuid128, nordic_uuid, 16) == 0) {
+                        is_uart_service = true;
+                        LOG_INFO(TAG, "📌 Found Nordic UART Service (128-bit)");
+                    }
                 }
             } else if (uuid->len == ESP_UUID_LEN_16) {
                 // Legacy services: 0xFFF0 or 0xFFE0
@@ -296,24 +320,18 @@ static void gattc_callback(esp_gattc_cb_event_t event, esp_gatt_if_t gatt_if, es
                 break;
             }
             
-            // All UART characteristic UUIDs we accept (different VEEPEAK firmware versions)
+            // VEEPEAK 128-bit UUIDs ONLY (CONFIRMED BY nRF CONNECT) - enforce exact match
             const esp_bt_uuid_t uart_char_uuids[] = {
-                // Nordic UART RX: 49535343-6DAA-4D02-ABF6-19569ACA69FE
+                // VEEPEAK 128-bit RX: 0000fff1-0000-1000-8000-00805f9b34fb (CONFIRMED BY nRF CONNECT)
                 { .len = ESP_UUID_LEN_128,
                   .uuid = { .uuid128 = 
-                      {0xFE,0x69,0xCA,0x9A,0x56,0x19,0xF6,0xAB,
-                       0x02,0x4D,0xA4,0x6D,0x43,0x53,0x53,0x49} } },
-                // Nordic UART TX: 49535343-ACA3-481C-91EC-D85E28A60318  
+                      {0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80,
+                       0x00, 0x10, 0x00, 0x00, 0xf1, 0xff, 0x00, 0x00} } },
+                // VEEPEAK 128-bit TX: 0000fff2-0000-1000-8000-00805f9b34fb (CONFIRMED BY nRF CONNECT)
                 { .len = ESP_UUID_LEN_128,
                   .uuid = { .uuid128 = 
-                      {0x18,0x03,0xA6,0x28,0x5E,0xD8,0xEC,0x91,
-                       0x1C,0x48,0xA3,0xAC,0x43,0x53,0x53,0x49} } },
-                // Legacy FFF1 (receive)
-                { .len = ESP_UUID_LEN_16, .uuid = { .uuid16 = 0xFFF1 } },
-                // Legacy FFF2 (transmit)
-                { .len = ESP_UUID_LEN_16, .uuid = { .uuid16 = 0xFFF2 } },
-                // Legacy FFE1 (combined RX/TX)
-                { .len = ESP_UUID_LEN_16, .uuid = { .uuid16 = 0xFFE1 } }
+                      {0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80,
+                       0x00, 0x10, 0x00, 0x00, 0xf2, 0xff, 0x00, 0x00} } }
             };
             
             LOG_INFO(TAG, "🔍 Looking for characteristics by UUID...");
@@ -356,12 +374,15 @@ static void gattc_callback(esp_gattc_cb_event_t event, esp_gatt_if_t gatt_if, es
             }
             
             if (!rx_found) {
-                LOG_ERROR(TAG, "❌ RX characteristic not found in any known UUID");
+                LOG_ERROR(TAG, "❌ VEEPEAK RX characteristic (0000fff1-...) not found!");
+                LOG_ERROR(TAG, "   This means UUID mismatch - VEEPEAK device may be using different UUIDs");
                 break;
             }
             
             if (!tx_found) {
-                LOG_WARN(TAG, "⚠️ TX characteristic not found, may not be able to send commands");
+                LOG_ERROR(TAG, "❌ VEEPEAK TX characteristic (0000fff2-...) not found!");
+                LOG_ERROR(TAG, "   This means UUID mismatch - VEEPEAK device may be using different UUIDs");
+                break;
             }
             
             // Find the CCCD handle for notifications
@@ -391,8 +412,18 @@ static void gattc_callback(esp_gattc_cb_event_t event, esp_gatt_if_t gatt_if, es
                 LOG_INFO(TAG, "   Service end: 0x%04X", svc_end);
             }
             
+            // CRITICAL FIX: Register for notifications BEFORE writing CCCD
+            LOG_INFO(TAG, "📥 Step 1: Registering for notifications on ESP32 controller...");
+            esp_err_t reg_ret = esp_ble_gattc_register_for_notify(gattc_if, peer_bda, rx_char_handle);
+            if (reg_ret == ESP_OK) {
+                LOG_INFO(TAG, "✅ Registered for notifications on handle 0x%04X", rx_char_handle);
+            } else {
+                LOG_ERROR(TAG, "❌ register_for_notify failed: %s", esp_err_to_name(reg_ret));
+            }
+            
             // Enable notifications - detailed logging for debugging
             uint8_t enable_ntf[2] = {0x01, 0x00};
+            LOG_INFO(TAG, "📥 Step 2: Writing CCCD to enable notifications on VEEPEAK...");
             LOG_INFO(TAG, "🔧 CCCD Write Details:");
             LOG_INFO(TAG, "   RX char handle: 0x%04X", rx_char_handle);
             LOG_INFO(TAG, "   CCCD handle: 0x%04X", rx_char_cccd_handle);
@@ -411,31 +442,67 @@ static void gattc_callback(esp_gattc_cb_event_t event, esp_gatt_if_t gatt_if, es
             break;
             
         case ESP_GATTC_REG_FOR_NOTIFY_EVT:
-            LOG_BT(TAG, "✅ Notifications registered successfully!");
+            LOG_INFO(TAG, "🎉 ESP32 controller registered for notifications successfully!");
+            LOG_INFO(TAG, "📥 Step 1 complete: ESP32 will now route incoming notifications to app");
+            LOG_INFO(TAG, "⏳ Step 2 pending: CCCD write to tell VEEPEAK to send notifications");
             break;
             
         case ESP_GATTC_WRITE_DESCR_EVT:
             LOG_INFO(TAG, "📝 CCCD Write Result: handle=0x%04X, status=%d", param->write.handle, param->write.status);
             if (param->write.status == ESP_GATT_OK) {
-                LOG_INFO(TAG, "✅ CCCD written - notifications enabled!");
-                LOG_INFO(TAG, "🔔 RX notifications should now arrive at handle 0x%04X", rx_char_handle);
                 
-                // Skip polling since RX characteristic doesn't support reading
-                LOG_INFO(TAG, "🚫 Polling disabled as RX characteristic does not support Read (status=0x02)");
-                
-                // Verify CCCD write by reading it back
-                LOG_INFO(TAG, "🔍 Reading back CCCD to verify...");
-                esp_err_t read_ret = esp_ble_gattc_read_char_descr(gattc_if, conn_id, rx_char_cccd_handle, ESP_GATT_AUTH_REQ_NONE);
-                if (read_ret != ESP_OK) {
-                    LOG_ERROR(TAG, "❌ Failed to read back CCCD: %s", esp_err_to_name(read_ret));
+                switch (cccd_state) {
+                    case CCCD_STATE_INITIAL_ENABLE:
+                        LOG_INFO(TAG, "✅ Initial CCCD written - notifications enabled!");
+                        LOG_INFO(TAG, "🔔 RX notifications expected at handle 0x%04X", rx_char_handle);
+                        
+                        // VEEPEAK firmware quirk: disable notifications to reset device state
+                        LOG_INFO(TAG, "🔧 VEEPEAK disable/enable sequence (nRF Connect discovery)");
+                        LOG_INFO(TAG, "⏳ Step 1: Disabling notifications to reset VEEPEAK state...");
+                        cccd_state = CCCD_STATE_DISABLING;
+                        
+                        uint8_t disable_ntf[2] = {0x00, 0x00};
+                        esp_err_t disable_ret = esp_ble_gattc_write_char_descr(gattc_if, conn_id, rx_char_cccd_handle,
+                                                                              sizeof(disable_ntf), disable_ntf,
+                                                                              ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NONE);
+                        if (disable_ret != ESP_OK) {
+                            LOG_ERROR(TAG, "❌ Failed to disable notifications: %s", esp_err_to_name(disable_ret));
+                        }
+                        break;
+                        
+                    case CCCD_STATE_DISABLING:
+                        LOG_INFO(TAG, "✅ Notifications disabled successfully");
+                        LOG_INFO(TAG, "⏳ Step 2: Re-enabling notifications after 1-second delay...");
+                        vTaskDelay(pdMS_TO_TICKS(1000)); // Brief delay to ensure disable takes effect
+                        cccd_state = CCCD_STATE_ENABLING;
+                        
+                        uint8_t enable_ntf[2] = {0x01, 0x00};
+                        esp_err_t enable_ret = esp_ble_gattc_write_char_descr(gattc_if, conn_id, rx_char_cccd_handle,
+                                                                             sizeof(enable_ntf), enable_ntf,
+                                                                             ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NONE);
+                        if (enable_ret != ESP_OK) {
+                            LOG_ERROR(TAG, "❌ Failed to re-enable notifications: %s", esp_err_to_name(enable_ret));
+                        }
+                        break;
+                        
+                    case CCCD_STATE_ENABLING:
+                        LOG_INFO(TAG, "✅ Notifications re-enabled - VEEPEAK should now be responsive!");
+                        LOG_INFO(TAG, "🎉 VEEPEAK disable/enable sequence complete");
+                        
+                        // Skip polling since RX characteristic doesn't support reading
+                        LOG_INFO(TAG, "🚫 Polling disabled as RX characteristic does not support Read (status=0x02)");
+                        
+                        // Start initialization after successful re-enable (matching nRF Connect timing)
+                        LOG_INFO(TAG, "⏱️ Starting initialization after 5-second stabilization delay...");
+                        vTaskDelay(pdMS_TO_TICKS(5000)); // Allow device to stabilize
+                        LOG_INFO(TAG, "🚀 Starting ELM327 initialization...");
+                        // FIXED: Increased stack size from 4096 to 8192 for safety
+                        xTaskCreate(initialize_elm327_task, "elm327_init", 8192, NULL, 2, NULL);
+                        break;
                 }
                 
-                LOG_INFO(TAG, "🚀 Starting ELM327 initialization...");
-                
-                // Start ELM327 initialization
-                xTaskCreate(initialize_elm327_task, "elm327_init", 4096, NULL, 2, NULL);
             } else {
-                LOG_ERROR(TAG, "❌ Write CCCD failed, status 0x%02X", param->write.status);
+                LOG_ERROR(TAG, "❌ CCCD write failed, status 0x%02X", param->write.status);
             }
             break;
             
@@ -448,17 +515,24 @@ static void gattc_callback(esp_gattc_cb_event_t event, esp_gatt_if_t gatt_if, es
             LOG_INFO(TAG, "🎉 SUCCESS! GATT NOTIFY received from handle 0x%04X", param->notify.handle);
             LOG_INFO(TAG, "   Expected RX handle: 0x%04X %s", rx_char_handle, 
                     (param->notify.handle == rx_char_handle) ? "(MATCH - PERFECT!)" : "(MISMATCH!)");
-            LOG_INFO(TAG, "⬇️ NOTIFY (%d bytes): %.*s", param->notify.value_len, param->notify.value_len, param->notify.value);
             
-            // Also log as hex for debugging
-            LOG_INFO(TAG, "⬇️ NOTIFY HEX: ");
-            for (int i = 0; i < param->notify.value_len; i++) {
-                printf("%02X ", param->notify.value[i]);
+            if (param->notify.handle == rx_char_handle) {
+                LOG_INFO(TAG, "⬇️ NOTIFY (%d bytes): %.*s", param->notify.value_len, param->notify.value_len, param->notify.value);
+                
+                // Also log as hex for debugging
+                printf("⬇️ NOTIFY HEX: ");
+                for (int i = 0; i < param->notify.value_len; i++) {
+                    printf("%02X ", param->notify.value[i]);
+                }
+                printf("\n");
+                
+                // Forward data to ELM327 handler 
+                handle_elm327_response((char *)param->notify.value, param->notify.value_len);
+            } else {
+                LOG_WARN(TAG, "⚠️ Notification from unexpected handle 0x%04X (expected 0x%04X)", 
+                         param->notify.handle, rx_char_handle);
+                LOG_WARN(TAG, "⚠️ Ignoring notification from wrong characteristic");
             }
-            printf("\n");
-            
-            // Forward data to ELM327 handler 
-            handle_elm327_response((char *)param->notify.value, param->notify.value_len);
             break;
         }
         
@@ -510,7 +584,34 @@ esp_err_t ble_uart_write(uint8_t *data, size_t len) {
         return ESP_FAIL;
     }
     
-    LOG_BT(TAG, "⬆️ SEND (%d bytes): %.*s", len, (int)len, (char *)data);
+    // Log the command clearly with proper escape sequences
+    char log_buffer[64];
+    snprintf(log_buffer, sizeof(log_buffer), "%.*s", (int)len, (char *)data);
+    
+    // Replace non-printable characters with escape sequences for display
+    char display_buffer[64];
+    int pos = 0;
+    for (size_t i = 0; i < len && pos < sizeof(display_buffer) - 5; i++) {
+        if (data[i] == '\r') {
+            pos += snprintf(display_buffer + pos, sizeof(display_buffer) - pos, "\\r");
+        } else if (data[i] == '\n') {
+            pos += snprintf(display_buffer + pos, sizeof(display_buffer) - pos, "\\n");
+        } else if (data[i] >= 32 && data[i] <= 126) {
+            display_buffer[pos++] = data[i];
+        } else {
+            pos += snprintf(display_buffer + pos, sizeof(display_buffer) - pos, "\\x%02X", data[i]);
+        }
+    }
+    display_buffer[pos] = '\0';
+    
+    LOG_BT(TAG, "⬆️ SEND (%zu bytes): %s", len, display_buffer);
+    
+    // Also log hex bytes for complete verification
+    printf("⬆️ SEND HEX: ");
+    for (size_t i = 0; i < len; i++) {
+        printf("%02X ", data[i]);
+    }
+    printf("\n");
     
     return esp_ble_gattc_write_char(gattc_if, conn_id, tx_char_handle,
                                    len, data, ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NONE);
@@ -633,10 +734,12 @@ void bluetooth_init(void) {
     LOG_BT(TAG, "✅ BLE initialization complete");
     
     // Start reconnection watchdog
-    xTaskCreate(reconnection_watchdog_task, "reconnect_watchdog", 4096, NULL, 2, NULL);
+    // FIXED: Increased stack size from 4096 to 6144 for BLE operations  
+    xTaskCreate(reconnection_watchdog_task, "reconnect_watchdog", 6144, NULL, 2, NULL);
     
     // Start BLE recovery monitor
-    xTaskCreate(ble_recovery_task, "ble_recovery", 3072, NULL, 1, NULL);
+    // FIXED: Increased stack size from 3072 to 4096 for safety
+    xTaskCreate(ble_recovery_task, "ble_recovery", 4096, NULL, 1, NULL);
     LOG_BT(TAG, "🔧 BLE recovery monitor started");
 }
 

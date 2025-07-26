@@ -121,9 +121,16 @@ void elm327_handle_response(const char *response) {
     
     // Check for common ELM327 responses
     if (strstr(response, "ELM327")) {
-        ESP_LOGI(TAG, "🔧 ELM327 device identified: %s", response);
+        ESP_LOGI(TAG, "🎉 VEEPEAK ELM327 device identified: %s", response);
+        LOG_INFO(TAG, "🚀 SUCCESS! VEEPEAK firmware handshake complete - device is responsive!");
+        if (strstr(response, "v2.")) {
+            LOG_INFO(TAG, "📋 Detected VEEPEAK ELM327 version 2.x - fully compatible");
+        }
     } else if (strstr(response, "OK")) {
         ESP_LOGD(TAG, "✅ Command acknowledged");
+    } else if (strcmp(response, "?") == 0) {
+        ESP_LOGI(TAG, "❓ VEEPEAK prompt/error response - device is responding to trigger");
+        LOG_INFO(TAG, "🔧 This '?' response indicates VEEPEAK processed the trigger command");
     } else if (strstr(response, "CAN ERROR") || strstr(response, "NO DATA")) {
         ESP_LOGW(TAG, "⚠️ CAN/ECU error: %s", response);
         
@@ -156,6 +163,24 @@ void elm327_handle_response(const char *response) {
         check_ecu_disconnection();
     } else if (strstr(response, "SEARCHING")) {
         ESP_LOGD(TAG, "🔍 ELM327 searching for ECU...");
+        // FIXED: Improved SEARCHING handling with retry logic
+        LOG_WARN(TAG, "⚠️ ECU searching - no ECU response yet");
+        consecutive_ecu_failures++;
+        
+        // If we've been searching too long, retry the command
+        static int search_retry_count = 0;
+        search_retry_count++;
+        if (search_retry_count >= 3) {
+            LOG_WARN(TAG, "🔄 Retrying ECU command after multiple SEARCHING responses...");
+            search_retry_count = 0;
+            vTaskDelay(pdMS_TO_TICKS(2000)); // Wait 2 seconds
+            
+            // Retry basic ECU test command
+            esp_err_t ret = elm327_send_command("0100");
+            if (ret != ESP_OK) {
+                LOG_ERROR(TAG, "❌ Failed to retry ECU command: %s", esp_err_to_name(ret));
+            }
+        }
     } else {
         // Successfully received some response - reset basic failure counter
         consecutive_fail = 0;
@@ -226,12 +251,31 @@ void process_received_data(const char *data, uint16_t len) {
             // Prompt detected - ELM327 is ready for next command
             elm_ready = true;
             ESP_LOGD(TAG, "🔥 Prompt '>' detected, elm_ready=true");
+            
+            // Process any buffered data up to the prompt (handles ?\r\r> pattern from nRF Connect)
+            if (rx_buffer_len > 0) {
+                rx_buffer[rx_buffer_len] = '\0';
+                ESP_LOGD(TAG, "Processing prompt response: '%s'", rx_buffer);
+                elm327_handle_response(rx_buffer);
+                rx_buffer_len = 0;
+                memset(rx_buffer, 0, RX_BUFFER_SIZE);
+            }
+            
+            // Set response flag for prompt detection (critical for initialization task)
+            response_received_flag = true;
+            ESP_LOGD(TAG, "🔥 response_received_flag set to true (prompt detected)");
         } else if (c >= 32 && c <= 126) {  // Printable ASCII characters
             rx_buffer[rx_buffer_len++] = c;
         } else {
             // Log any unexpected characters
             ESP_LOGD(TAG, "Unexpected char: 0x%02X (%d)", c, c);
         }
+    }
+    
+    // Set flag if any valid data was processed (ensures initialization task detects responses)
+    if (rx_buffer_len > 0 || strstr(data, ">") != NULL) {
+        response_received_flag = true;
+        ESP_LOGD(TAG, "🔥 response_received_flag set to true (data processed)");
     }
 }
 
@@ -394,7 +438,8 @@ void reset_ecu_connection(void) {
     ESP_LOGI(TAG, "🔗 Starting ECU reconnection process...");
     
     // Start verification in separate task to avoid blocking
-    xTaskCreate(ecu_reconnection_task, "ecu_reconnect", 4096, NULL, 5, NULL);
+    // FIXED: Increased stack size from 4096 to 6144 for ELM327 operations
+    xTaskCreate(ecu_reconnection_task, "ecu_reconnect", 6144, NULL, 5, NULL);
 }
 
 // ECU reconnection task (runs in separate thread)
@@ -545,8 +590,13 @@ void initialize_elm327(void) {
     set_ecu_status(true);  // Update ECU status for LED control
     LOG_INFO(TAG, "ELM327 initialization complete - diagnostics above show readiness!");
     
-    // Signal that ELM327 is ready
-    xSemaphoreGive(connection_semaphore);
+    // FIXED: Signal that ELM327 is ready (with NULL check)
+    if (connection_semaphore != NULL) {
+        LOG_INFO(TAG, "📡 Giving semaphore %p - ELM327 ready", connection_semaphore);
+        xSemaphoreGive(connection_semaphore);
+    } else {
+        LOG_WARN(TAG, "⚠️ Skipping semaphore give - connection_semaphore not initialized (test mode?)");
+    }
     
     // Now verify connection to vehicle ECU
     verify_ecu_connection();
@@ -555,16 +605,17 @@ void initialize_elm327(void) {
 // ELM327 initialization task (runs in separate thread)
 void initialize_elm327_task(void *pv) {
     LOG_ELM(TAG, "ELM327 initialization task started...");
-    LOG_INFO(TAG, "🚀 === ELM327 INITIALIZATION SEQUENCE START ===");
+    LOG_INFO(TAG, "🚀 === ELM327 INITIALIZATION START ===");
+    LOG_INFO(TAG, "📋 VEEPEAK should be responsive after disable/enable sequence");
     
-    // Wait for BLE connection to stabilize
-    LOG_INFO(TAG, "⏱️ Waiting 5 seconds for BLE connection to stabilize...");
+    // Additional stabilization after notification re-enable (matching nRF Connect timing)
+    LOG_INFO(TAG, "⏱️ Waiting 5 seconds for VEEPEAK to stabilize after notification reset...");
     vTaskDelay(pdMS_TO_TICKS(5000));
     
-    // Test different command formats
-    LOG_INFO(TAG, "🔄 Phase 1: Testing basic communication with ATZ...");
+    // Test standard command formats (should work after disable/enable sequence)
+    LOG_INFO(TAG, "🔄 Phase 1: Testing ATZ commands (post-CCCD reset)...");
     
-    const char *cmd_formats[] = {"ATZ\r\n", "ATZ\r", "ATZ\n"};
+    const char *cmd_formats[] = {"ATZ\r", "ATZ\r\n", "ATZ\n"};
     const uint8_t max_retries = 3;
     bool response_received = false;
     
@@ -589,17 +640,18 @@ void initialize_elm327_task(void *pv) {
             
             LOG_INFO(TAG, "✅ Command sent, waiting for response...");
             
-            // Wait for response (up to 10 seconds per attempt)
+            // Wait for response (up to 30 seconds per attempt - nRF Connect showed ~21s delay)
             TickType_t start_time = xTaskGetTickCount();
-            TickType_t timeout = pdMS_TO_TICKS(10000);  // 10 second timeout per attempt
+            TickType_t timeout = pdMS_TO_TICKS(30000);  // 30 second timeout per attempt
             
             while (xTaskGetTickCount() - start_time < timeout) {
-                if (response_received_flag) {
-                    response_received = true;
-                    LOG_INFO(TAG, "✅ Response received! Command format: %s", 
-                            fmt_idx == 0 ? "\\r\\n" : (fmt_idx == 1 ? "\\r" : "\\n"));
-                    break;
-                }
+                            if (response_received_flag) {
+                response_received = true;
+                LOG_INFO(TAG, "🎉 SUCCESS! VEEPEAK responded after CCCD reset! Command format: %s", 
+                        fmt_idx == 0 ? "\\r" : (fmt_idx == 1 ? "\\r\\n" : "\\n"));
+                LOG_INFO(TAG, "📋 Expected response patterns: '?' (error), 'ELM327 v2.x' (success), '>' (prompt)");
+                break;
+            }
                 vTaskDelay(pdMS_TO_TICKS(100));  // Check every 100ms
             }
             
@@ -627,7 +679,7 @@ void initialize_elm327_task(void *pv) {
             esp_err_t ret = ble_uart_write((uint8_t *)alt_cmds[i], strlen(alt_cmds[i]));
             if (ret == ESP_OK) {
                 TickType_t start_time = xTaskGetTickCount();
-                while (!response_received_flag && (xTaskGetTickCount() - start_time < pdMS_TO_TICKS(10000))) {
+                while (!response_received_flag && (xTaskGetTickCount() - start_time < pdMS_TO_TICKS(30000))) {
                     vTaskDelay(pdMS_TO_TICKS(100));
                 }
                 if (response_received_flag) {
@@ -682,8 +734,8 @@ void initialize_elm327_task(void *pv) {
         
         esp_err_t ret = ble_uart_write((uint8_t *)init_cmds[i], strlen(init_cmds[i]));
         if (ret == ESP_OK) {
-            // Wait for response with longer timeout for OBD commands
-            uint32_t timeout_ms = (i >= 9) ? 5000 : 2000;  // 5s for OBD commands, 2s for AT commands
+            // Wait for response with longer timeout for all commands (nRF Connect showed ~21s delay)
+            uint32_t timeout_ms = 30000;  // 30s for all commands based on nRF Connect findings
             TickType_t start_time = xTaskGetTickCount();
             
             while (!response_received_flag && (xTaskGetTickCount() - start_time < pdMS_TO_TICKS(timeout_ms))) {
@@ -710,8 +762,13 @@ void initialize_elm327_task(void *pv) {
     initialization_in_progress = false;
     LOG_INFO(TAG, "✅ === ELM327 INITIALIZATION COMPLETE ===");
     
-    // Signal that ELM327 is ready
-    xSemaphoreGive(connection_semaphore);
+    // FIXED: Signal that ELM327 is ready (with NULL check to prevent crash)
+    if (connection_semaphore != NULL) {
+        LOG_INFO(TAG, "📡 Giving semaphore %p - ELM327 task complete", connection_semaphore);
+        xSemaphoreGive(connection_semaphore);
+    } else {
+        LOG_WARN(TAG, "⚠️ Skipping semaphore give - connection_semaphore not initialized (test mode?)");
+    }
     
     // Now verify connection to vehicle ECU
     verify_ecu_connection();

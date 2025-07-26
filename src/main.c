@@ -16,6 +16,8 @@
 
 // Enable this define to build a minimal firmware that only scans for the
 // VEEPEAK adapter (no OBD, relays, etc.)
+// FIXED: Now properly initializes ELM327 system to prevent semaphore crashes
+// NOTE: Disable for full app testing with OBD data collection and relay control
 #define BT_TEST_MODE 1
 
 #if BT_TEST_MODE
