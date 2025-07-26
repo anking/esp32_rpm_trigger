@@ -551,6 +551,9 @@ void log_vehicle_status(void) {
              vehicle_data.rpm,
              vehicle_data.throttle_position,
              vehicle_data.vehicle_speed);
+    
+    // Update NOS system with current vehicle data
+    update_nos_system(vehicle_data.rpm, vehicle_data.throttle_position, vehicle_data.vehicle_speed);
 }
 
  

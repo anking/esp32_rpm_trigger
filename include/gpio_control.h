@@ -21,6 +21,11 @@ void set_ecu_status(bool connected);
 // Button functions
 void trigger_led_burst(void);
 
+// NOS system functions
+void update_nos_system(uint32_t rpm, uint8_t throttle, uint8_t speed);
+bool get_auto_injection_mode(void);
+void toggle_auto_injection_mode(void);
+
 // NOS control outputs
 void set_nos_ready(bool ready);
 void set_nos_auto_injection(bool active);
