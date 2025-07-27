@@ -3,10 +3,10 @@
 
 // Logging control flags - Set to 1 to enable, 0 to disable
 #define ENABLE_VERBOSE_LOGGING    0  // Detailed status messages (DISABLED - STACK OVERFLOW FIX)
-#define ENABLE_DEBUG_LOGGING      0  // Debug and trace messages (DISABLED - STACK OVERFLOW FIX)
+#define ENABLE_DEBUG_LOGGING      0  // Debug and trace messages (ENABLED TEMPORARILY - SPEED DEBUGGING)
 #define ENABLE_EMOJI_LOGGING      0  // Emoji-decorated messages (DISABLED - REDUCING NOISE)
 #define ENABLE_BLUETOOTH_LOGGING  0  // Detailed Bluetooth protocol logs (DISABLED - REDUCING NOISE)
-#define ENABLE_ELM327_LOGGING     0  // Detailed ELM327 communication logs (DISABLED - REDUCING NOISE)
+#define ENABLE_ELM327_LOGGING     0  // Detailed ELM327 communication logs (ENABLED - DEBUGGING HONDA CIVIC)
 #define ENABLE_ESP_BT_LOGS        0  // ESP-IDF Bluetooth stack logs (DISABLED - STACK OVERFLOW FIX)
 
 // Conditional logging macros
@@ -17,7 +17,7 @@
 #endif
 
 #if ENABLE_DEBUG_LOGGING
-    #define LOG_DEBUG(tag, format, ...) ESP_LOGD(tag, format, ##__VA_ARGS__)
+    #define LOG_DEBUG(tag, format, ...) ESP_LOGI(tag, format, ##__VA_ARGS__)
 #else
     #define LOG_DEBUG(tag, format, ...)
 #endif

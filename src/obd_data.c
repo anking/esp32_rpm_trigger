@@ -29,123 +29,176 @@ vehicle_data_t vehicle_data = {
 };
 
 // Timestamp tracking for data freshness (in FreeRTOS ticks)
-static TickType_t rpm_last_update = 0;
-static TickType_t throttle_last_update = 0;
-static TickType_t speed_last_update = 0;
+static volatile TickType_t rpm_last_update = 0;
+static volatile TickType_t throttle_last_update = 0;
+static volatile TickType_t speed_last_update = 0;
 
-#define DATA_TIMEOUT_MS 500
-#define DATA_TIMEOUT_TICKS pdMS_TO_TICKS(DATA_TIMEOUT_MS)
-
-// Check for stale data and reset values older than timeout
-static void check_and_reset_stale_data(bool using_individual_pids) {
-    TickType_t current_time = xTaskGetTickCount();
-    
-    // Adjust timeout based on polling strategy
-    TickType_t timeout = using_individual_pids ? 
-        pdMS_TO_TICKS(1000) :  // 1 second for individual PIDs (750ms cycle + margin)
-        pdMS_TO_TICKS(600);    // 600ms for multi-PID (500ms cycle + margin)
-    
-    // Check RPM freshness
-    if ((current_time - rpm_last_update) > timeout) {
-        if (vehicle_data.rpm != 0) {
-            vehicle_data.rpm = 0;
-            LOG_WARN(TAG, "⚠️ RPM data stale, reset to 0");
-        }
-    }
-    
-    // Check throttle freshness  
-    if ((current_time - throttle_last_update) > timeout) {
-        if (vehicle_data.throttle_position != 0) {
-            vehicle_data.throttle_position = 0;
-            LOG_WARN(TAG, "⚠️ Throttle data stale, reset to 0");
-        }
-    }
-    
-    // Check speed freshness
-    if ((current_time - speed_last_update) > timeout) {
-        if (vehicle_data.vehicle_speed != 0) {
-            vehicle_data.vehicle_speed = 0;
-            LOG_WARN(TAG, "⚠️ Speed data stale, reset to 0");
-        }
+// PID data length lookup (in hex chars, including PID itself)
+// returns number of hex chars in DATA *excluding* the PID byte
+static size_t get_pid_data_length(uint8_t pid) {
+    switch (pid) {
+        case 0x0C: return 4;  // RPM: 2 data bytes (4 hex chars)
+        case 0x0D: return 2;  // Speed: 1 data byte
+        case 0x11: return 2;  // Throttle: 1 data byte
+        case 0x0F: return 2;  // IAT: 1 data byte
+        case 0x05: return 2;  // ECT: 1 data byte
+        case 0x0B: return 2;  // MAP: 1 data byte
+        case 0x10: return 4;  // MAF: 2 data bytes (4 hex chars)
+        case 0x0E: return 2;  // Timing Advance: 1 data byte
+        default:   return 2;  // Default: 1 data byte
     }
 }
 
 // Parse multi-PID response line
 void parse_multi_pid_line(char *line)
 {
-    /* Example after trimming CR/LF + prompt:
-       "41 0C 1A F8 41 0D 3C 41 11 5A" */
+    /* Example CAN frame response:
+       First line:    "008"            - Number of data bytes in hex
+       Frame 0:       "0:410C0B381122" - Mode 41 + RPM (0C 0B38) + Throttle (11 22)
+       Frame 1:       "1:0D005555555555" - Speed (0D 00) + padding
+       
+       Frame format:
+       41 0C 0B 38 11 22 - Frame 0
+       ^^ ^^ ^^ ^^ ^^ ^^
+       |  |  |____|  |__|
+       |  |    RPM   Throttle (PID 11, value 22)
+       |  PID 0C
+       Mode 41
 
-    // Handle lines that start with "0: " or similar prefixes
-    char *data_start = strstr(line, "41 ");
-    if (data_start == NULL) {
-        return;   // not a Mode-01 reply
-    }
-    
-    // Use the data starting from "41" instead of the beginning of the line
-    line = data_start;
+       0D 00 55 55 55 55 - Frame 1
+       ^^ ^^ ^^
+       |  |  padding
+       |  Speed value (00)
+       PID 0D */
 
-    char *tok = strtok(line, " ");
-    
-    // First token should be "41" (Mode 1 response)
-    if (!tok || strcmp(tok, "41") != 0) {
+    static int expected_bytes = 0;  // Total hex chars we expect (2 per byte)
+    static int received_bytes = 0;  // Hex chars received so far
+    bool data_parsed = false;       // Track if any valid data was parsed
+    char hex[3] = {0};             // Buffer for 2 hex chars + null terminator
+
+    // Check if this is a byte count line (e.g., "008")
+    // Only treat as byte count if ≤3 chars AND all hex digits
+    if (strlen(line) <= 3 && 
+        strspn(line, "0123456789ABCDEFabcdef") == strlen(line)) {
+        expected_bytes = strtol(line, NULL, 16);  // Read as hex
+        expected_bytes *= 2;  // Convert to hex char count
+        received_bytes = 0;   // Reset counter for new response
+        LOG_DEBUG(TAG, "Expecting %d hex chars of OBD data", expected_bytes);
         return;
     }
-    
-    bool data_parsed = false;  // Track if any valid data was parsed
-    
-    // Now parse PID+data pairs
-    while ((tok = strtok(NULL, " ")) != NULL) {
-        // Stop at filler bytes (ELM pad)
-        if (strcmp(tok, "55") == 0) {
-            break;
-        }
-        
-        // This token should be a PID
-        uint8_t pid_val = HEXBYTE_TO_INT(tok);
-        
-        char *data1 = strtok(NULL, " ");   // first data byte
-        if (!data1) {
-            break;
-        }
-        
-        char *data2 = NULL;
-        // Check if this PID needs two data bytes
-        if (pid_val == 0x0C) {  // RPM needs 2 bytes
-            data2 = strtok(NULL, " ");
-        }
-        
-        switch (pid_val) {
-            case 0x0C: {                   // RPM (needs two bytes)
-                if (!data2) {
+
+    // Skip line number prefix if present (e.g., "0:" or "1:")
+    if (line[0] >= '0' && line[0] <= '9' && line[1] == ':') {
+        line += 2;  // Skip "0:" or "1:" prefix
+    }
+
+    // Skip any leading spaces
+    while (*line == ' ') line++;
+
+    // Check for Mode 1 response in first frame
+    if (strncmp(line, "41", 2) == 0) {
+        // Skip the mode byte (41)
+        line += 2;
+        received_bytes += 2;
+
+        // Process the rest of the frame
+        while (strlen(line) >= 2) {  // Need at least PID
+            // Exit if we've received all expected bytes
+            if (expected_bytes > 0 && received_bytes >= expected_bytes) break;
+
+            // Get PID
+            strncpy(hex, line, 2); hex[2]='\0';
+            uint8_t pid = HEXBYTE_TO_INT(hex);
+            line += 2;
+            received_bytes += 2;
+
+            // Get data length for this PID
+            size_t data_len = get_pid_data_length(pid);
+            if (strlen(line) < data_len) break;  // Not enough data
+
+            switch (pid) {
+                case 0x0C: {  // RPM (needs two bytes)
+                    strncpy(hex, line, 2); hex[2]='\0';
+                    uint8_t msb = HEXBYTE_TO_INT(hex);
+                    strncpy(hex, line + 2, 2); hex[2]='\0';
+                    uint8_t lsb = HEXBYTE_TO_INT(hex);
+                    uint16_t raw = (msb << 8) | lsb;
+                    vehicle_data.rpm = raw / 4;
+                    rpm_last_update = xTaskGetTickCount();
+                    data_parsed = true;
+                    LOG_DEBUG(TAG, "RPM updated: %lu (from %02X %02X)", 
+                             vehicle_data.rpm, msb, lsb);
                     break;
                 }
-                uint16_t raw = (HEXBYTE_TO_INT(data1) << 8) |
-                               HEXBYTE_TO_INT(data2);
-                vehicle_data.rpm = raw / 4;
-                rpm_last_update = xTaskGetTickCount(); // Update timestamp
-                data_parsed = true; // Mark data as parsed
-                break;
+                case 0x11: {  // Throttle position (1 byte)
+                    strncpy(hex, line, 2); hex[2]='\0';
+                    uint8_t value = HEXBYTE_TO_INT(hex);
+                    vehicle_data.throttle_position = (value * 100) / 255;
+                    throttle_last_update = xTaskGetTickCount();
+                    data_parsed = true;
+                    LOG_DEBUG(TAG, "Throttle updated: %d%% (from %02X)", 
+                             vehicle_data.throttle_position, value);
+                    break;
+                }
+                case 0x0D: {  // Vehicle speed (1 byte)
+                    strncpy(hex, line, 2); hex[2]='\0';
+                    uint8_t value = HEXBYTE_TO_INT(hex);
+                    vehicle_data.vehicle_speed = value;
+                    speed_last_update = xTaskGetTickCount();
+                    data_parsed = true;
+                    LOG_DEBUG(TAG, "Speed updated: %d km/h (from %02X)", value, value);
+                    break;
+                }
+                default:
+                    LOG_DEBUG(TAG, "Skipping unknown PID %02X", pid);
+                    break;
             }
-            case 0x0D:                      // Vehicle speed (1 byte)
-                vehicle_data.vehicle_speed = HEXBYTE_TO_INT(data1);
-                speed_last_update = xTaskGetTickCount(); // Update timestamp
-                data_parsed = true; // Mark data as parsed
-                break;
-            case 0x11:                      // Throttle position (1 byte)
-                vehicle_data.throttle_position =
-                    (HEXBYTE_TO_INT(data1) * 100) / 255;
-                throttle_last_update = xTaskGetTickCount(); // Update timestamp
-                data_parsed = true; // Mark data as parsed
-                break;
-            default:
-                break;
+
+            // Move past the data bytes
+            line += data_len;
+            received_bytes += data_len;
+        }
+    } else {
+        // Process second frame (no mode byte)
+        while (strlen(line) >= 2) {  // Need at least PID
+            // Exit if we've received all expected bytes
+            if (expected_bytes > 0 && received_bytes >= expected_bytes) break;
+
+            // Get PID
+            strncpy(hex, line, 2); hex[2]='\0';
+            uint8_t pid = HEXBYTE_TO_INT(hex);
+            line += 2;
+            received_bytes += 2;
+
+            // Get data length for this PID
+            size_t data_len = get_pid_data_length(pid);
+            if (strlen(line) < data_len) break;  // Not enough data
+
+            switch (pid) {
+                case 0x0D: {  // Vehicle speed (1 byte)
+                    strncpy(hex, line, 2); hex[2]='\0';
+                    uint8_t value = HEXBYTE_TO_INT(hex);
+                    vehicle_data.vehicle_speed = value;
+                    speed_last_update = xTaskGetTickCount();
+                    data_parsed = true;
+                    LOG_DEBUG(TAG, "Speed updated: %d km/h (from %02X)", 
+                             vehicle_data.vehicle_speed, value);
+                    break;
+                }
+                default:
+                    LOG_DEBUG(TAG, "Skipping unknown PID %02X", pid);
+                    break;
+            }
+
+            // Move past the data bytes
+            line += data_len;
+            received_bytes += data_len;
         }
     }
 
     // Reset ECU error counters if any data was successfully parsed
     if (data_parsed) {
-        reset_ecu_error_counters(); // Reset ECU disconnection error counters
+        reset_ecu_error_counters();
     }
 }
 
@@ -319,11 +372,8 @@ void obd_task(void *pv) {
     LOG_INFO(TAG, "🚀 Starting optimized OBD polling system");
     LOG_INFO(TAG, "📊 Single request strategy: 010C110D (RPM + Throttle + Speed)");
     
-    static bool use_individual_pids = false;
-    static uint8_t individual_pid_cycles = 0;
-    static TickType_t last_success_time = 0;
     static TickType_t last_ecu_check = 0;
-    
+
     // Adaptive polling delay management
     static uint16_t current_delay_ms = MIN_COMMAND_DELAY_MS;
     static uint8_t errors_at_max_delay = 0;
@@ -332,9 +382,6 @@ void obd_task(void *pv) {
         // Connection checks remain the same
         if (!is_connected) {
             LOG_WARN(TAG, "🔴 Bluetooth disconnected - stopping OBD polling");
-            use_individual_pids = false;
-            individual_pid_cycles = 0;
-            last_success_time = 0;
             last_ecu_check = 0;
             current_delay_ms = MIN_COMMAND_DELAY_MS;
             errors_at_max_delay = 0;
@@ -361,9 +408,6 @@ void obd_task(void *pv) {
             }
             
             LOG_INFO(TAG, "✅ ECU reconnected - resuming OBD data polling");
-            use_individual_pids = false;
-            individual_pid_cycles = 0;
-            last_success_time = xTaskGetTickCount();
             last_ecu_check = xTaskGetTickCount();
             current_delay_ms = MIN_COMMAND_DELAY_MS;
             errors_at_max_delay = 0;
@@ -378,69 +422,19 @@ void obd_task(void *pv) {
         }
         
         if (is_connected && elm327_initialized) {
-            // Check if we should switch to individual PIDs due to errors
-            if ((current_time - last_success_time) > pdMS_TO_TICKS(5000)) {
-                if (!use_individual_pids) {
-                    LOG_WARN(TAG, "⚠️ Switching to individual PID requests due to errors");
-                    use_individual_pids = true;
-                    individual_pid_cycles = 0;
-                }
-            }
-            
-            if (use_individual_pids) {
-                // Fallback: Individual PID requests with adaptive delay
-                static uint8_t phase = 0;
-                const char *cmd = NULL;
-                switch (phase % 3) {
-                    case 0: cmd = "010C"; break;  // RPM
-                    case 1: cmd = "0111"; break;  // Throttle
-                    case 2: cmd = "010D"; break;  // Speed
-                }
-                
-                if (cmd) {
-                    bool success = send_obd_command_adaptive(cmd, &current_delay_ms, &errors_at_max_delay);
-                    if (success) {
-                        last_success_time = xTaskGetTickCount();
-                    }
-                }
-                
-                phase = (phase + 1) % 3;
-                
-                if (phase == 0) {
-                    individual_pid_cycles++;
-                    if (individual_pid_cycles >= 3) {
-                        LOG_INFO(TAG, "🔄 3 individual PID cycles completed - switching back to multi-PID mode");
-                        use_individual_pids = false;
-                        individual_pid_cycles = 0;
-                        last_success_time = xTaskGetTickCount();
-                    }
-                }
-            } else {
-                // Optimized: Single multi-PID request for all data
-                bool success = send_obd_command_adaptive("010C110D", &current_delay_ms, &errors_at_max_delay);
-                if (success) {
-                    last_success_time = xTaskGetTickCount();
-                }
-            }
+            // Always send multi-PID request (RPM + Throttle + Speed)
+            send_obd_command_adaptive("010C110D", &current_delay_ms, &errors_at_max_delay);
             
             // Use adaptive delay
             vTaskDelay(pdMS_TO_TICKS(current_delay_ms));
             
             // Check for stale data
-            check_and_reset_stale_data(use_individual_pids);
+            // check_and_reset_stale_data(use_individual_pids); // This function is no longer needed
             
             // Log vehicle status after each cycle
             log_vehicle_status();
-            
-            // Update success time if we have valid data
-            if (vehicle_data.rpm > 0 || vehicle_data.throttle_position > 0 || vehicle_data.vehicle_speed > 0) {
-                last_success_time = current_time;
-            }
         } else {
             LOG_INFO(TAG, "⏳ Waiting for ELM327 connection...");
-            use_individual_pids = false;
-            individual_pid_cycles = 0;
-            last_success_time = 0;
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
     }

@@ -1,6 +1,7 @@
 #include "esp_log.h"
 #include <string.h>
 #include <stdio.h>
+#include <ctype.h>
 
 #include "logging_config.h"
 #include "elm327.h"
@@ -12,6 +13,19 @@
 extern uint16_t tx_char_handle;
 
 static const char *TAG = "ELM327";
+
+// Helper function to check for line number prefix safely
+static bool has_line_number_prefix(const char *str) {
+    if (!str || strlen(str) < 2) return false;
+    char first = str[0];
+    char second = str[1];
+    return first >= '0' && first <= '9' && second == ':';
+}
+
+// Helper function to check for Mode 1 response
+static bool is_mode1_response(const char *str) {
+    return str && strlen(str) >= 2 && strncmp(str, "41", 2) == 0;
+}
 
 /*
  * ELM327 Communication Logging:
@@ -176,12 +190,20 @@ void elm327_handle_response(const char *response) {
     } else {
         consecutive_fail = 0;
         
-        if (strstr(response, "41 00") != NULL) {
+        
+        // Remove line number prefix if present (e.g., "0:" or "1:")
+        const char *data = response;
+        if (has_line_number_prefix(response)) {
+            data = response + 2;  // Skip the line number prefix
+        }
+
+        // Check for any valid Mode 1 response (41xx)
+        if (is_mode1_response(data)) {
             ecu_test_response_received = true;
             LOG_DEBUG(TAG, "🎯 ECU test response detected: %s", response);
         }
-        
-        process_obd_response(response);
+
+        parse_multi_pid_line(response);
     }
 }
 
@@ -194,19 +216,6 @@ void handle_elm327_response(const char *data, size_t len) {
     process_received_data(data, data_len);
 }
 
-// Process OBD data responses
-void process_obd_response(const char *response) {
-    // Only reset ECU error counters for actual OBD responses (start with "41")
-    if (strstr(response, "41 ") != NULL) {
-        // This is a valid OBD Mode 1 response - parse it
-        char response_copy[256];
-        strncpy(response_copy, response, sizeof(response_copy) - 1);
-        response_copy[sizeof(response_copy) - 1] = '\0';
-        parse_multi_pid_line(response_copy);
-        // Note: parse_multi_pid_line will call reset_ecu_error_counters() if successful
-    }
-}
-
 // Process received data from Bluetooth
 void process_received_data(const char *data, uint16_t len) {
     if (!data || len == 0) {
@@ -215,21 +224,21 @@ void process_received_data(const char *data, uint16_t len) {
     
     LOG_DEBUG(TAG, "Raw data received (%d bytes): %.*s", len, len, data);
     
-    // Add received data to buffer
+    // Process on both \r and \n for better compatibility with Honda ECUs
     for (uint16_t i = 0; i < len && rx_buffer_len < (RX_BUFFER_SIZE - 1); i++) {
         char c = data[i];
         
-        if (c == '\r') {
+        if (c == '\r' || c == '\n') {
             if (rx_buffer_len > 0) {
-                rx_buffer[rx_buffer_len] = '\0';
+                rx_buffer[rx_buffer_len] = '\0';  // Null terminate
+                
                 LOG_DEBUG(TAG, "Processing response (len=%d): '%s'", rx_buffer_len, rx_buffer);
                 elm327_handle_response(rx_buffer);
+                
+                // Clear buffer for next response
                 rx_buffer_len = 0;
                 memset(rx_buffer, 0, RX_BUFFER_SIZE);
             }
-        } else if (c == '\n') {
-            LOG_DEBUG(TAG, "Ignoring LF character");
-            continue;
         } else if (c == '>') {
             elm_ready = true;
             LOG_DEBUG(TAG, "🔥 Prompt '>' detected, elm_ready=true");
@@ -277,40 +286,52 @@ bool test_ecu_connectivity(void) {
     ecu_test_response_received = false;
     memset(rx_buffer, 0, RX_BUFFER_SIZE);
     rx_buffer_len = 0;
-    
-    esp_err_t ret = elm327_send_command_with_options("0100", false);
-    if (ret != ESP_OK) {
-        LOG_WARN(TAG, "❌ Failed to send ECU test command");
-        return false;
-    }
-    
-    TickType_t start_time = xTaskGetTickCount();
-    TickType_t timeout = pdMS_TO_TICKS(4000);
-    
-    while ((xTaskGetTickCount() - start_time) < timeout) {
-        vTaskDelay(pdMS_TO_TICKS(50));
-        
-        if (ecu_test_response_received) {
-            LOG_INFO(TAG, "✅ ECU connection verified! Supported PIDs detected");
-            return true;
+    LOG_INFO(TAG, "Quick ECU verify: sending supported-PID request");
+    esp_err_t ret;
+
+    for (int retry = 0; retry < 2; retry++) {
+        if (retry > 0) {
+            LOG_INFO(TAG, "🔄 ECU test retry #%d", retry + 1);
+            vTaskDelay(pdMS_TO_TICKS(2000)); // Wait between retries
         }
         
-        if (rx_buffer_len > 5) {
-            if (strstr(rx_buffer, "UNABLE TO CONNECT") != NULL ||
-                strstr(rx_buffer, "CAN ERROR") != NULL ||
-                strstr(rx_buffer, "NO DATA") != NULL) {
-                return false;
+        ret = elm327_send_command_with_options("0100", false);
+        if (ret != ESP_OK) {
+            LOG_WARN(TAG, "❌ Failed to send ECU test command");
+            continue;
+        }
+        
+        TickType_t start_time = xTaskGetTickCount();
+        TickType_t timeout = pdMS_TO_TICKS(15000); // 15s timeout
+        
+        while ((xTaskGetTickCount() - start_time) < timeout) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            
+            if (ecu_test_response_received) {
+                LOG_INFO(TAG, "✅ ECU connection verified! Supported PIDs detected");
+                return true;
             }
             
-            if (strstr(rx_buffer, "SEARCHING") != NULL) {
-                memset(rx_buffer, 0, RX_BUFFER_SIZE);
-                rx_buffer_len = 0;
-                continue;
+            if (rx_buffer_len > 5) {
+                if (strstr(rx_buffer, "SEARCHING") != NULL) {
+                    LOG_DEBUG(TAG, "⏳ ECU still searching, continuing...");
+                    // Clear buffer and continue waiting
+                    memset(rx_buffer, 0, RX_BUFFER_SIZE);
+                    rx_buffer_len = 0;
+                    continue;
+                }
+                
+                if (strstr(rx_buffer, "UNABLE TO CONNECT") != NULL ||
+                    strstr(rx_buffer, "CAN ERROR") != NULL ||
+                    strstr(rx_buffer, "NO DATA") != NULL) {
+                    LOG_WARN(TAG, "❌ ECU test failed: %s", rx_buffer);
+                    break; // Try next retry
+                }
             }
         }
     }
     
-    LOG_DEBUG(TAG, "❌ ECU test timeout - no valid response received");
+    LOG_WARN(TAG, "⏰ ECU test timeout after retries - no response from vehicle");
     return false;
 }
 
@@ -321,8 +342,9 @@ void verify_ecu_connection(void) {
     
     ecu_connected = false;
     int attempt = 1;
+    const int MAX_ATTEMPTS = 10; // Limited to 10 attempts to prevent infinite loop
     
-    while (!ecu_connected) {
+    while (!ecu_connected && attempt <= MAX_ATTEMPTS) {
         if (!is_connected) {
             LOG_WARN(TAG, "🔴 Bluetooth disconnected during ECU verification - stopping");
             ecu_connected = false;
@@ -351,6 +373,17 @@ void verify_ecu_connection(void) {
         
         vTaskDelay(pdMS_TO_TICKS(2000));
         attempt++;
+    }
+    
+    if (!ecu_connected) {
+        LOG_ERROR(TAG, "❌ Failed to connect to ECU after %d attempts", MAX_ATTEMPTS);
+        LOG_ERROR(TAG, "💡 Please check:");
+        LOG_ERROR(TAG, "   - Vehicle ignition is ON");
+        LOG_ERROR(TAG, "   - OBD cable is securely connected");
+        LOG_ERROR(TAG, "   - Vehicle is compatible with OBD-II");
+        LOG_ERROR(TAG, "   - Try cycling ignition OFF/ON and restart");
+        LOG_ERROR(TAG, "   - Try unplugging/replugging OBD adapter");
+        LOG_ERROR(TAG, "   - For Honda Civic 2018: Engine should be running");
     }
 }
 
@@ -417,64 +450,72 @@ void reset_ecu_error_counters(void) {
     if (can_error_count > 0) can_error_count--;
 }
 
-// Gentle ELM327 initialization
+// Gentle ELM327 initialization optimized for Honda Civic 2018
 void initialize_elm327(void) {
-    initialization_in_progress = true;
+    LOG_ELM(TAG, "Starting Honda-optimized ELM327 initialization...");
     
-    connection_semaphore = xSemaphoreCreateBinary();
-    if (connection_semaphore == NULL) {
-        LOG_ERROR(TAG, "❌ Failed to create connection semaphore");
-        initialization_in_progress = false;
-        return;
-    }
+    // Wait for ELM327 to settle after connection
+    LOG_ELM(TAG, "Waiting 3 seconds for ELM327 to settle...");
+    vTaskDelay(pdMS_TO_TICKS(3000));
     
-    memset(rx_buffer, 0, RX_BUFFER_SIZE);
-    rx_buffer_len = 0;
-    
-    vTaskDelay(pdMS_TO_TICKS(1000));  // Reduced from 3000ms
-    
+    // Reset command
+    LOG_ELM(TAG, "Sending ATZ (Reset)...");
     esp_err_t ret = elm327_send_command("ATZ");
     if (ret != ESP_OK) {
-        LOG_ERROR(TAG, "❌ Failed to send ATZ");
+        LOG_WARN(TAG, "Failed to send ATZ");
         initialization_in_progress = false;
         return;
     }
+    vTaskDelay(pdMS_TO_TICKS(3000)); // Wait for reset
     
-    vTaskDelay(pdMS_TO_TICKS(1000));  // Reduced from 3000ms
+    // Simple initialization sequence optimized for Honda
+    LOG_ELM(TAG, "Configuring ELM327 for Honda Civic 2018...");
     
-    ret = elm327_send_command("ATE0");
-    if (ret != ESP_OK) {
-        LOG_ERROR(TAG, "❌ Failed to send ATE0");
-        initialization_in_progress = false;
-        return;
-    }
-    vTaskDelay(pdMS_TO_TICKS(200));  // Reduced from 500ms
+    // Minimal initialization sequence
+    LOG_ELM(TAG, "Sending ATE0 (Echo OFF)...");
+    elm327_send_command("ATE0");
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    LOG_ELM(TAG, "Sending ATL0 (Linefeeds OFF)...");
+    elm327_send_command("ATL0");
+    vTaskDelay(pdMS_TO_TICKS(1000));
     
-    // Send initialization commands
-    const char *init_cmds[] = {
-        "AT SP 0", "AT CRA", "AT AL", "AT SH 7DF", "AT CAF1",
-        "AT ST 32", "ATH0", "AT RV", "AT DPN", "0100"
-    };
+    LOG_ELM(TAG, "Sending ATS0 (Spaces OFF)...");
+    elm327_send_command("ATS0");
+    vTaskDelay(pdMS_TO_TICKS(1000));
     
-    for (size_t i = 0; i < sizeof(init_cmds)/sizeof(init_cmds[0]); i++) {
-        elm327_send_command(init_cmds[i]);
-        vTaskDelay(pdMS_TO_TICKS(200));  // Reduced from 500ms
-    }
+    LOG_ELM(TAG, "Sending ATH0 (Headers OFF)...");
+    elm327_send_command("ATH0");
+    vTaskDelay(pdMS_TO_TICKS(1000));
     
-    // Try specific protocols
-    elm327_send_command("AT SP 6");
-    vTaskDelay(pdMS_TO_TICKS(200));  // Reduced from 500ms
+    LOG_ELM(TAG, "Sending ATSP0 (Auto protocol)...");
+    elm327_send_command("ATSP0");
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    
+    // Test voltage
+    LOG_ELM(TAG, "Testing with AT RV (voltage check)...");
+    elm327_send_command("AT RV");
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    
+    // Check protocol
+    LOG_ELM(TAG, "Checking protocol with AT DPN...");
+    elm327_send_command("AT DPN");
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    
+    // Test OBD
+    LOG_ELM(TAG, "Testing OBD with 0100 (Supported PIDs)...");
     elm327_send_command("0100");
-    vTaskDelay(pdMS_TO_TICKS(1000));  // Reduced from 3000ms
+    vTaskDelay(pdMS_TO_TICKS(2000));
     
-    elm327_send_command("AT SP 7");
-    vTaskDelay(pdMS_TO_TICKS(200));  // Reduced from 500ms
-    elm327_send_command("0100");
-    vTaskDelay(pdMS_TO_TICKS(1000));  // Reduced from 3000ms
+    LOG_ELM(TAG, "Honda Civic 2018 troubleshooting:");
+    LOG_ELM(TAG, "1. Engine MUST be running (not just ignition ON)");
+    LOG_ELM(TAG, "2. Press accelerator or turn on A/C to wake up PCM");
+    LOG_ELM(TAG, "3. Hood should be open (Honda security feature)");
+    LOG_ELM(TAG, "4. Wait 15s after engine start (PCM initialization)");
+    LOG_ELM(TAG, "5. Try cycling ignition: OFF (10s) -> ON -> Start Engine");
+    LOG_ELM(TAG, "6. Check raw CAN frames in logs for bus activity");
     
-    elm327_send_command("AT SP 0");
-    vTaskDelay(pdMS_TO_TICKS(200));  // Reduced from 500ms
-    
+    // Mark as initialized
     elm327_initialized = true;
     elm_ready = true;
     // Note: ECU status will be set by verify_ecu_connection() when actually connected
@@ -496,177 +537,15 @@ void initialize_elm327_task(void *pv) {
     LOG_INFO(TAG, "🚀 === ELM327 INITIALIZATION START ===");
     LOG_INFO(TAG, "📋 VEEPEAK should be responsive after disable/enable sequence");
     
+    // FIXED: Removed Phase 1 ATZ testing - old version didn't have it, directly called initialize_elm327
     // Additional stabilization after notification re-enable
     LOG_INFO(TAG, "⏱️ Waiting for VEEPEAK to stabilize after notification reset...");
     vTaskDelay(pdMS_TO_TICKS(1000));  // Reduced from 5000ms
     
-    // Test standard command formats (should work after disable/enable sequence)
-    LOG_INFO(TAG, "🔄 Phase 1: Testing ATZ commands (post-CCCD reset)...");
+    // Perform gentle initialization like old version
+    initialize_elm327();
     
-    const char *cmd_formats[] = {"ATZ\r", "ATZ\r\n", "ATZ\n"};
-    const uint8_t max_retries = 3;
-    bool response_received = false;
-    
-    for (size_t fmt_idx = 0; fmt_idx < sizeof(cmd_formats)/sizeof(cmd_formats[0]) && !response_received; fmt_idx++) {
-        const char *cmd = cmd_formats[fmt_idx];
-        LOG_INFO(TAG, "🔍 Testing command format %zu/3: %s", fmt_idx + 1, 
-                fmt_idx == 0 ? "ATZ\\r\\n" : (fmt_idx == 1 ? "ATZ\\r" : "ATZ\\n"));
-        
-        for (uint8_t retry = 0; retry < max_retries && !response_received; retry++) {
-            LOG_INFO(TAG, "🔄 Sending command (attempt %d/%d)...", retry + 1, max_retries);
-            
-            // Clear response flag before sending
-            response_received_flag = false;
-            elm_ready = false;
-            
-            esp_err_t ret = ble_uart_write((uint8_t *)cmd, strlen(cmd));
-            if (ret != ESP_OK) {
-                LOG_ERROR(TAG, "❌ Failed to send command: %s", esp_err_to_name(ret));
-                vTaskDelay(pdMS_TO_TICKS(1000));
-                continue;
-            }
-            
-            LOG_INFO(TAG, "✅ Command sent, waiting for response...");
-            
-            // Wait for response (up to 30 seconds per attempt - nRF Connect showed ~21s delay)
-            TickType_t start_time = xTaskGetTickCount();
-            TickType_t timeout = pdMS_TO_TICKS(30000);  // 30 second timeout per attempt
-            
-            while (xTaskGetTickCount() - start_time < timeout) {
-                            if (response_received_flag) {
-                response_received = true;
-                LOG_INFO(TAG, "🎉 SUCCESS! VEEPEAK responded after CCCD reset! Command format: %s", 
-                        fmt_idx == 0 ? "\\r" : (fmt_idx == 1 ? "\\r\\n" : "\\n"));
-                LOG_INFO(TAG, "📋 Expected response patterns: '?' (error), 'ELM327 v2.x' (success), '>' (prompt)");
-                break;
-            }
-                vTaskDelay(pdMS_TO_TICKS(100));  // Check every 100ms
-            }
-            
-            if (!response_received && retry < max_retries - 1) {
-                LOG_WARN(TAG, "⚠️ No response to command, retrying...");
-                vTaskDelay(pdMS_TO_TICKS(1000));  // Wait 1 second before retry
-            }
-        }
-        
-        if (!response_received) {
-            LOG_WARN(TAG, "⚠️ No response with format: %s", 
-                    fmt_idx == 0 ? "\\r\\n" : (fmt_idx == 1 ? "\\r" : "\\n"));
-        }
-    }
-    
-    // Try alternative commands if ATZ failed
-    if (!response_received) {
-        LOG_WARN(TAG, "⚠️ ATZ failed with all formats, trying alternative commands...");
-        const char *alt_cmds[] = {"ATI\r", "ATI\r\n", "AT@1\r", "AT@1\r\n"};
-        
-        for (size_t i = 0; i < sizeof(alt_cmds)/sizeof(alt_cmds[0]) && !response_received; i++) {
-            LOG_INFO(TAG, "🔄 Sending alternative command: %s", alt_cmds[i]);
-            
-            response_received_flag = false;
-            esp_err_t ret = ble_uart_write((uint8_t *)alt_cmds[i], strlen(alt_cmds[i]));
-            if (ret == ESP_OK) {
-                TickType_t start_time = xTaskGetTickCount();
-                while (!response_received_flag && (xTaskGetTickCount() - start_time < pdMS_TO_TICKS(30000))) {
-                    vTaskDelay(pdMS_TO_TICKS(100));
-                }
-                if (response_received_flag) {
-                    response_received = true;
-                    LOG_INFO(TAG, "✅ Response received to alternative command: %s", alt_cmds[i]);
-                }
-            }
-        }
-    }
-    
-    if (!response_received) {
-        LOG_ERROR(TAG, "❌ Failed to get response after all attempts (ATZ + alternatives)");
-        LOG_ERROR(TAG, "💡 This indicates a communication problem:");
-        LOG_ERROR(TAG, "   - VEEPEAK device may not be sending notifications");
-        LOG_ERROR(TAG, "   - BLE GATT notifications may not be working"); 
-        LOG_ERROR(TAG, "   - Device may require different initialization sequence");
-        LOG_ERROR(TAG, "   - Vehicle OBD-II port may be inactive (ignition off, engine not running)");
-        LOG_ERROR(TAG, "   - OBD-II connector may be loose or faulty");
-        LOG_ERROR(TAG, "   - VEEPEAK firmware may be incompatible with this approach");
-        goto initialization_failed;
-    }
-    
-    // If we got a response, continue with full initialization
-    LOG_INFO(TAG, "🎉 SUCCESS! Basic communication verified - proceeding with full initialization");
-    
-    // Send comprehensive initialization commands
-    LOG_INFO(TAG, "🔧 Phase 2: Sending complete ELM327 initialization sequence...");
-    
-    const char *init_cmds[] = {
-        "ATE0\r",       // Turn off echo
-        "AT SP 0\r",    // Auto protocol detection
-        "AT CRA\r",     // Reset all filters
-        "AT AL\r",      // Allow long frames
-        "AT SH 7DF\r",  // Set broadcast address
-        "AT CAF1\r",    // Enable auto-format ISO-TP
-        "AT ST 32\r",   // Set shorter timeout (50ms)
-        "ATH0\r",       // Headers off
-        "AT RV\r",      // Read voltage (test command)
-        "AT DPN\r",     // Check detected protocol
-        "0100\r"        // Basic OBD test - get supported PIDs
-    };
-    
-    const char *cmd_descriptions[] = {
-        "Disabling echo", "Setting auto protocol", "Resetting filters", "Enabling long frames",
-        "Setting broadcast address", "Enabling auto-format", "Setting timeout", "Disabling headers",
-        "Reading voltage", "Checking protocol", "Testing OBD (supported PIDs)"
-    };
-    
-    for (size_t i = 0; i < sizeof(init_cmds)/sizeof(init_cmds[0]); i++) {
-        LOG_INFO(TAG, "├─ %s (%s)...", cmd_descriptions[i], init_cmds[i]);
-        response_received_flag = false;
-        
-        esp_err_t ret = ble_uart_write((uint8_t *)init_cmds[i], strlen(init_cmds[i]));
-        if (ret == ESP_OK) {
-            // Wait for response with longer timeout for all commands (nRF Connect showed ~21s delay)
-            uint32_t timeout_ms = 30000;  // 30s for all commands based on nRF Connect findings
-            TickType_t start_time = xTaskGetTickCount();
-            
-            while (!response_received_flag && (xTaskGetTickCount() - start_time < pdMS_TO_TICKS(timeout_ms))) {
-                vTaskDelay(pdMS_TO_TICKS(100));
-            }
-            
-            if (response_received_flag) {
-                LOG_INFO(TAG, "├─ ✅ Response received");
-            } else {
-                LOG_WARN(TAG, "├─ ⚠️ No response, but continuing...");
-            }
-        } else {
-            LOG_ERROR(TAG, "├─ ❌ Failed to send command: %s", esp_err_to_name(ret));
-        }
-        
-        // Small delay between commands
-        vTaskDelay(pdMS_TO_TICKS(200));
-    }
-    
-    // Mark as initialized
-    elm327_initialized = true;
-    elm_ready = true;
-    // Note: ECU status will be set by verify_ecu_connection() when actually connected
-    initialization_in_progress = false;
-    LOG_INFO(TAG, "✅ === ELM327 INITIALIZATION COMPLETE ===");
-    
-    // FIXED: Signal that ELM327 is ready (with NULL check to prevent crash)
-    if (connection_semaphore != NULL) {
-        LOG_INFO(TAG, "📡 Giving semaphore %p - ELM327 task complete", connection_semaphore);
-        xSemaphoreGive(connection_semaphore);
-    } else {
-        LOG_WARN(TAG, "⚠️ Skipping semaphore give - connection_semaphore not initialized (test mode?)");
-    }
-    
-    // Now verify connection to vehicle ECU
-    verify_ecu_connection();
-    
+    // FIXED: Removed Phase 2 comprehensive init - merged into initialize_elm327
     // Delete this task when done
     vTaskDelete(NULL);
-    
-initialization_failed:
-    LOG_ERROR(TAG, "❌ ELM327 initialization failed");
-    initialization_in_progress = false;  // Clear flag on failure
-    elm327_initialized = false;
-    vTaskDelete(NULL);
-} 
+}
