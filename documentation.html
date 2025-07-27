@@ -1,0 +1,730 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP32 OBD-II NOS Controller Documentation</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            line-height: 1.6;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f8f9fa;
+            color: #333;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 2rem;
+            border-radius: 12px;
+            margin-bottom: 2rem;
+            text-align: center;
+        }
+        
+        .header h1 {
+            margin: 0;
+            font-size: 2.5rem;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+        }
+        
+        .header p {
+            margin: 0.5rem 0 0 0;
+            font-size: 1.1rem;
+            opacity: 0.9;
+        }
+        
+        .container {
+            background: white;
+            border-radius: 12px;
+            padding: 2rem;
+            margin-bottom: 2rem;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        
+        h2 {
+            color: #2c3e50;
+            border-bottom: 3px solid #3498db;
+            padding-bottom: 0.5rem;
+            margin-top: 0;
+        }
+        
+        h3 {
+            color: #34495e;
+            margin-top: 1.5rem;
+        }
+        
+        .wiring-diagram {
+            background: #f8f9fa;
+            border: 2px dashed #dee2e6;
+            border-radius: 8px;
+            padding: 2rem;
+            margin: 1rem 0;
+            font-family: 'Courier New', monospace;
+            overflow-x: auto;
+        }
+        
+        .pin-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 1rem 0;
+        }
+        
+        .pin-table th,
+        .pin-table td {
+            border: 1px solid #ddd;
+            padding: 12px;
+            text-align: left;
+        }
+        
+        .pin-table th {
+            background: #3498db;
+            color: white;
+            font-weight: bold;
+        }
+        
+        .pin-table tr:nth-child(even) {
+            background: #f9f9f9;
+        }
+        
+        .feature-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 1rem;
+            margin: 1rem 0;
+        }
+        
+        .feature-card {
+            background: #e8f4fd;
+            border-left: 4px solid #3498db;
+            padding: 1rem;
+            border-radius: 4px;
+        }
+        
+        .feature-card h4 {
+            margin: 0 0 0.5rem 0;
+            color: #2c3e50;
+        }
+        
+        .code-block {
+            background: #2c3e50;
+            color: #ecf0f1;
+            padding: 1rem;
+            border-radius: 4px;
+            overflow-x: auto;
+            font-family: 'Courier New', monospace;
+            margin: 1rem 0;
+        }
+        
+        .warning {
+            background: #fff3cd;
+            border: 1px solid #ffeeba;
+            border-radius: 4px;
+            padding: 1rem;
+            margin: 1rem 0;
+            border-left: 4px solid #ffc107;
+        }
+        
+        .success {
+            background: #d4edda;
+            border: 1px solid #c3e6cb;
+            border-radius: 4px;
+            padding: 1rem;
+            margin: 1rem 0;
+            border-left: 4px solid #28a745;
+        }
+        
+        .status-indicator {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            margin-right: 8px;
+        }
+        
+        .status-bt { background: #007bff; }
+        .status-ecu { background: #28a745; }
+        .status-nos { background: #dc3545; }
+        
+        .toc {
+            background: #f8f9fa;
+            border-radius: 8px;
+            padding: 1.5rem;
+            margin-bottom: 2rem;
+        }
+        
+        .toc ul {
+            list-style: none;
+            padding-left: 0;
+        }
+        
+        .toc li {
+            margin: 0.5rem 0;
+        }
+        
+        .toc a {
+            color: #3498db;
+            text-decoration: none;
+            font-weight: 500;
+        }
+        
+        .toc a:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🚗 ESP32 OBD-II NOS Controller</h1>
+        <p>Professional Nitrous Oxide System Controller with Real-time Vehicle Monitoring</p>
+    </div>
+
+    <div class="container toc">
+        <h2>📋 Table of Contents</h2>
+        <ul>
+            <li><a href="#overview">Project Overview</a></li>
+            <li><a href="#features">Key Features</a></li>
+            <li><a href="#hardware">Hardware Requirements</a></li>
+            <li><a href="#wiring">Wiring Diagram</a></li>
+            <li><a href="#installation">Installation & Setup</a></li>
+            <li><a href="#operation">Operation Guide</a></li>
+            <li><a href="#troubleshooting">Troubleshooting</a></li>
+            <li><a href="#safety">Safety Information</a></li>
+            <li><a href="#technical">Technical Specifications</a></li>
+        </ul>
+    </div>
+
+    <div class="container" id="overview">
+        <h2>🎯 Project Overview</h2>
+        <p>This project implements a sophisticated NOS (Nitrous Oxide System) controller using an ESP32-S3 microcontroller that interfaces with your vehicle's OBD-II port via Bluetooth. The system monitors real-time engine parameters and provides intelligent control over nitrous injection systems.</p>
+        
+        <div class="feature-grid">
+            <div class="feature-card">
+                <h4>🔗 Wireless OBD-II Communication</h4>
+                <p>Connects to ELM327 Bluetooth adapters for real-time vehicle data monitoring</p>
+            </div>
+            <div class="feature-card">
+                <h4>⚡ Real-time Engine Monitoring</h4>
+                <p>Monitors RPM, throttle position, and vehicle speed with adaptive polling</p>
+            </div>
+            <div class="feature-card">
+                <h4>🎮 Intelligent NOS Control</h4>
+                <p>Manual and automatic nitrous injection modes with safety parameters</p>
+            </div>
+            <div class="feature-card">
+                <h4>💡 Visual Status Indicators</h4>
+                <p>RGB LED and relay-controlled external LED indicators for system status</p>
+            </div>
+        </div>
+    </div>
+
+    <div class="container" id="features">
+        <h2>🌟 Key Features</h2>
+        
+        <h3>Core Functionality</h3>
+        <ul>
+            <li><strong>Bluetooth OBD-II Integration:</strong> Wireless connection to ELM327 adapters</li>
+            <li><strong>Multi-PID Data Collection:</strong> Efficient single-request polling for RPM, throttle, and speed</li>
+            <li><strong>Adaptive Communication:</strong> Dynamic delay adjustment based on ECU response times</li>
+            <li><strong>Robust Error Recovery:</strong> Automatic reconnection and error handling</li>
+        </ul>
+
+        <h3>NOS Control System</h3>
+        <ul>
+            <li><strong>Manual Mode:</strong> Button-activated nitrous injection</li>
+            <li><strong>Automatic Mode:</strong> RPM and throttle-based automatic activation</li>
+            <li><strong>Safety Thresholds:</strong> Configurable RPM and throttle position limits</li>
+            <li><strong>Relay-based Outputs:</strong> High-current relay control for nitrous solenoids</li>
+        </ul>
+
+        <h3>Status Indication</h3>
+        <ul>
+            <li><span class="status-indicator status-bt"></span><strong>Bluetooth Status:</strong> Connection state indication</li>
+            <li><span class="status-indicator status-ecu"></span><strong>ECU Status:</strong> Vehicle communication status</li>
+            <li><span class="status-indicator status-nos"></span><strong>NOS Status:</strong> System readiness and mode indication</li>
+        </ul>
+    </div>
+
+    <div class="container" id="hardware">
+        <h2>🔧 Hardware Requirements</h2>
+        
+        <h3>Main Components</h3>
+        <table class="pin-table">
+            <tr>
+                <th>Component</th>
+                <th>Specification</th>
+                <th>Purpose</th>
+            </tr>
+            <tr>
+                <td>ESP32-S3 DevKit</td>
+                <td>ESP32-S3-DevKitC-1 or compatible</td>
+                <td>Main microcontroller with Bluetooth LE</td>
+            </tr>
+            <tr>
+                <td>6-Channel Relay Board</td>
+                <td>ESP32-S3-Relay-6CH or compatible</td>
+                <td>High-current switching for NOS and LED control</td>
+            </tr>
+            <tr>
+                <td>ELM327 Bluetooth Adapter</td>
+                <td>OBD-II to Bluetooth interface</td>
+                <td>Vehicle OBD-II communication</td>
+            </tr>
+            <tr>
+                <td>WS2812 RGB LED</td>
+                <td>Built-in on relay board (GPIO 38)</td>
+                <td>Status indication</td>
+            </tr>
+            <tr>
+                <td>Passive Buzzer</td>
+                <td>Built-in on relay board (GPIO 21)</td>
+                <td>Audio feedback</td>
+            </tr>
+        </table>
+
+        <h3>Optional Components</h3>
+        <ul>
+            <li><strong>External Status LEDs:</strong> Connected via relays 3-5 for remote indication</li>
+            <li><strong>NOS Solenoid Valves:</strong> Connected via relays 1-2 (10A rating)</li>
+            <li><strong>Additional Sensors:</strong> For extended vehicle monitoring</li>
+        </ul>
+    </div>
+
+    <div class="container" id="wiring">
+        <h2>🔌 Wiring Diagram</h2>
+        
+        <h3>ESP32-S3 Pin Assignments</h3>
+        <table class="pin-table">
+            <tr>
+                <th>GPIO Pin</th>
+                <th>Function</th>
+                <th>Connection</th>
+                <th>Notes</th>
+            </tr>
+            <tr>
+                <td>GPIO 0</td>
+                <td>Button Input</td>
+                <td>BOOT Button</td>
+                <td>Built-in button for mode switching</td>
+            </tr>
+            <tr>
+                <td>GPIO 1</td>
+                <td>NOS Ready Relay</td>
+                <td>Relay CH1</td>
+                <td>NOS system readiness control</td>
+            </tr>
+            <tr>
+                <td>GPIO 2</td>
+                <td>NOS Auto Injection</td>
+                <td>Relay CH2</td>
+                <td>Automatic injection control</td>
+            </tr>
+            <tr>
+                <td>GPIO 21</td>
+                <td>Buzzer</td>
+                <td>Passive Buzzer</td>
+                <td>Audio feedback</td>
+            </tr>
+            <tr>
+                <td>GPIO 38</td>
+                <td>RGB Status LED</td>
+                <td>WS2812 LED</td>
+                <td>Main status indication</td>
+            </tr>
+            <tr>
+                <td>GPIO 41</td>
+                <td>BT Status LED</td>
+                <td>Relay CH3</td>
+                <td>External Bluetooth status LED</td>
+            </tr>
+            <tr>
+                <td>GPIO 42</td>
+                <td>ECU Status LED</td>
+                <td>Relay CH4</td>
+                <td>External ECU status LED</td>
+            </tr>
+            <tr>
+                <td>GPIO 45</td>
+                <td>NOS Status LED</td>
+                <td>Relay CH5</td>
+                <td>External NOS status LED</td>
+            </tr>
+            <tr>
+                <td>GPIO 46</td>
+                <td>Reserved</td>
+                <td>Relay CH6</td>
+                <td>Available for future expansion</td>
+            </tr>
+        </table>
+
+        <div class="wiring-diagram">
+<pre>
+ESP32-S3 OBD-II NOS Controller Wiring Diagram
+==============================================
+
+┌─────────────────────────────────────────────────────────────────┐
+│                    ESP32-S3-Relay-6CH Board                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  [ESP32-S3]  ┌─ GPIO 38 ── WS2812 RGB LED (Status)            │
+│              ├─ GPIO 21 ── Buzzer (Audio Feedback)             │
+│              ├─ GPIO 0  ── BOOT Button (Mode Switch)           │
+│              │                                                 │
+│              ├─ GPIO 1  ── Relay CH1 ── NOS Ready Control      │
+│              ├─ GPIO 2  ── Relay CH2 ── NOS Auto Injection     │
+│              ├─ GPIO 41 ── Relay CH3 ── BT Status LED          │
+│              ├─ GPIO 42 ── Relay CH4 ── ECU Status LED         │
+│              ├─ GPIO 45 ── Relay CH5 ── NOS Status LED         │
+│              └─ GPIO 46 ── Relay CH6 ── (Reserved)             │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              │ USB-C (Programming/Power)
+                              │
+┌─────────────────────────────────────────────────────────────────┐
+│                     External Connections                       │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Relay CH1 (NOS Ready):                                        │
+│  ├─ COM ── NOS System Power                                    │
+│  ├─ NO  ── NOS Solenoid (+)                                    │
+│  └─ NC  ── (Not Connected)                                     │
+│                                                                 │
+│  Relay CH2 (NOS Auto):                                         │
+│  ├─ COM ── NOS Control Signal                                  │
+│  ├─ NO  ── Auto Injection Enable                               │
+│  └─ NC  ── Manual Mode                                         │
+│                                                                 │
+│  Relay CH3 (BT LED):                                           │
+│  ├─ COM ── +12V                                                │
+│  ├─ NO  ── Blue LED (+)                                        │
+│  └─ NC  ── (Not Connected)                                     │
+│                                                                 │
+│  Relay CH4 (ECU LED):                                          │
+│  ├─ COM ── +12V                                                │
+│  ├─ NO  ── Green LED (+)                                       │
+│  └─ NC  ── (Not Connected)                                     │
+│                                                                 │
+│  Relay CH5 (NOS LED):                                          │
+│  ├─ COM ── +12V                                                │
+│  ├─ NO  ── Red LED (+)                                         │
+│  └─ NC  ── (Not Connected)                                     │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              │ Bluetooth LE
+                              │
+┌─────────────────────────────────────────────────────────────────┐
+│                      ELM327 Adapter                            │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  [ELM327 Bluetooth] ── OBD-II Connector ── Vehicle            │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+
+Status LED Behavior:
+===================
+Bluetooth LED (Blue):    Solid = Connected, Blinking = Connecting
+ECU LED (Green):         Solid = Connected, Blinking = Connecting  
+NOS LED (Red):           Solid = Ready, Slow Blink = Auto Mode
+
+RGB LED Status:
+==============
+Blue Solid:      Bluetooth Connected
+Green Solid:     ECU Connected & Ready
+Red Solid:       NOS Armed
+Yellow Flash:    Button Press
+Red Flash:       Error/Warning
+</pre>
+        </div>
+
+        <div class="warning">
+            <strong>⚠️ WARNING:</strong> NOS systems involve high-pressure gases and flammable materials. Ensure all electrical connections are secure and properly rated for the current loads. Always follow local safety regulations and vehicle manufacturer guidelines.
+        </div>
+    </div>
+
+    <div class="container" id="installation">
+        <h2>📥 Installation & Setup</h2>
+        
+        <h3>1. Software Installation</h3>
+        <div class="code-block">
+# Install PlatformIO Core
+pip install platformio
+
+# Clone the repository
+git clone &lt;repository-url&gt;
+cd BT-NOS-Controller
+
+# Build and upload firmware
+pio run -t upload -t monitor
+        </div>
+
+        <h3>2. Hardware Setup</h3>
+        <ol>
+            <li><strong>Connect ESP32-S3:</strong> Mount the ESP32-S3 on the relay board</li>
+            <li><strong>Connect External Components:</strong> Wire NOS solenoids and status LEDs to relays</li>
+            <li><strong>Install ELM327:</strong> Plug ELM327 adapter into vehicle OBD-II port</li>
+            <li><strong>Power Connection:</strong> Connect 12V power supply to relay board</li>
+        </ol>
+
+        <h3>3. First Boot Configuration</h3>
+        <ol>
+            <li>Power on the system</li>
+            <li>Monitor serial output for initialization messages</li>
+            <li>Pair with ELM327 adapter (auto-discovery enabled)</li>
+            <li>Start vehicle engine for ECU connection test</li>
+            <li>Verify status LED operation</li>
+        </ol>
+
+        <div class="success">
+            <strong>✅ Success Indicators:</strong> Blue LED for Bluetooth, Green LED for ECU connection, and real-time RPM/throttle/speed data in serial monitor.
+        </div>
+    </div>
+
+    <div class="container" id="operation">
+        <h2>🎮 Operation Guide</h2>
+        
+        <h3>System Startup Sequence</h3>
+        <ol>
+            <li><strong>Power On:</strong> RGB LED shows initialization sequence</li>
+            <li><strong>Bluetooth Scan:</strong> Blue LED blinks while searching for ELM327</li>
+            <li><strong>ELM327 Connection:</strong> Blue LED solid when connected</li>
+            <li><strong>ECU Communication:</strong> Green LED blinks during ECU initialization</li>
+            <li><strong>System Ready:</strong> Green LED solid, NOS system operational</li>
+        </ol>
+
+        <h3>Operating Modes</h3>
+        
+        <h4>Manual Mode (Default)</h4>
+        <ul>
+            <li>NOS activation requires manual button press</li>
+            <li>Red LED solid when NOS conditions are met</li>
+            <li>Press BOOT button to activate NOS injection</li>
+            <li>Safety thresholds still apply</li>
+        </ul>
+
+        <h4>Automatic Mode</h4>
+        <ul>
+            <li>Toggle mode by holding BOOT button for 3 seconds</li>
+            <li>Red LED slow blink indicates auto mode active</li>
+            <li>NOS activates automatically when conditions are met:
+                <ul>
+                    <li>RPM > 2000 (configurable)</li>
+                    <li>Throttle > 80% (configurable)</li>
+                    <li>Vehicle speed > 30 km/h (configurable)</li>
+                </ul>
+            </li>
+        </ul>
+
+        <h3>Status Monitoring</h3>
+        <table class="pin-table">
+            <tr>
+                <th>Indicator</th>
+                <th>State</th>
+                <th>Meaning</th>
+            </tr>
+            <tr>
+                <td>Blue LED</td>
+                <td>Off</td>
+                <td>No Bluetooth connection</td>
+            </tr>
+            <tr>
+                <td>Blue LED</td>
+                <td>Blinking</td>
+                <td>Connecting to ELM327</td>
+            </tr>
+            <tr>
+                <td>Blue LED</td>
+                <td>Solid</td>
+                <td>ELM327 connected</td>
+            </tr>
+            <tr>
+                <td>Green LED</td>
+                <td>Off</td>
+                <td>No ECU communication</td>
+            </tr>
+            <tr>
+                <td>Green LED</td>
+                <td>Blinking</td>
+                <td>Connecting to ECU</td>
+            </tr>
+            <tr>
+                <td>Green LED</td>
+                <td>Solid</td>
+                <td>ECU connected, data flowing</td>
+            </tr>
+            <tr>
+                <td>Red LED</td>
+                <td>Off</td>
+                <td>NOS not ready</td>
+            </tr>
+            <tr>
+                <td>Red LED</td>
+                <td>Solid</td>
+                <td>NOS ready (manual mode)</td>
+            </tr>
+            <tr>
+                <td>Red LED</td>
+                <td>Slow Blink</td>
+                <td>NOS ready (auto mode)</td>
+            </tr>
+        </table>
+    </div>
+
+    <div class="container" id="troubleshooting">
+        <h2>🔧 Troubleshooting</h2>
+        
+        <h3>Common Issues</h3>
+        
+        <h4>Bluetooth Connection Problems</h4>
+        <ul>
+            <li><strong>Blue LED not lighting:</strong> Check ELM327 adapter power and pairing</li>
+            <li><strong>Connection drops:</strong> Verify ELM327 adapter quality and distance</li>
+            <li><strong>Slow response:</strong> Check for interference from other Bluetooth devices</li>
+        </ul>
+
+        <h4>ECU Communication Issues</h4>
+        <ul>
+            <li><strong>Green LED not lighting:</strong> Ensure engine is running (not just ignition ON)</li>
+            <li><strong>"NO DATA" errors:</strong> Try cycling ignition OFF/ON and restart engine</li>
+            <li><strong>Intermittent connection:</strong> Check OBD-II connector for loose connections</li>
+        </ul>
+
+        <h4>Honda Civic 2018 Specific</h4>
+        <div class="warning">
+            <strong>Honda Civic 2018 Troubleshooting:</strong>
+            <ul>
+                <li>Engine MUST be running (not just ignition ON)</li>
+                <li>Press accelerator or turn on A/C to wake up PCM</li>
+                <li>Hood should be open (Honda security feature)</li>
+                <li>Wait 15s after engine start (PCM initialization)</li>
+                <li>Try cycling ignition: OFF (10s) → ON → Start Engine</li>
+            </ul>
+        </div>
+
+        <h4>NOS System Issues</h4>
+        <ul>
+            <li><strong>Red LED not activating:</strong> Check safety threshold settings</li>
+            <li><strong>Manual mode not working:</strong> Verify button wiring and relay connections</li>
+            <li><strong>Auto mode not engaging:</strong> Check RPM/throttle/speed thresholds</li>
+        </ul>
+
+        <h3>Debug Information</h3>
+        <p>Enable debug logging by setting <code>ENABLE_DEBUG_LOGGING = 1</code> in <code>include/logging_config.h</code> to see detailed communication logs.</p>
+    </div>
+
+    <div class="container" id="safety">
+        <h2>⚠️ Safety Information</h2>
+        
+        <div class="warning">
+            <h3>CRITICAL SAFETY WARNINGS</h3>
+            <ul>
+                <li><strong>High Pressure Systems:</strong> NOS systems operate at extremely high pressures. Ensure all connections are rated for the pressure.</li>
+                <li><strong>Electrical Safety:</strong> Use properly rated relays and fuses for all high-current connections.</li>
+                <li><strong>Vehicle Integration:</strong> Improper installation can damage vehicle electronics. Consult professionals if unsure.</li>
+                <li><strong>Legal Compliance:</strong> Check local regulations regarding NOS systems and vehicle modifications.</li>
+                <li><strong>Emergency Shutdown:</strong> Always include manual emergency cutoff switches for safety.</li>
+            </ul>
+        </div>
+
+        <h3>Safety Features</h3>
+        <ul>
+            <li><strong>Threshold Monitoring:</strong> System monitors RPM, throttle, and speed limits</li>
+            <li><strong>Fail-Safe Operation:</strong> System defaults to safe state on errors</li>
+            <li><strong>Connection Monitoring:</strong> Automatic shutdown if communication is lost</li>
+            <li><strong>Relay Isolation:</strong> High-current loads isolated from microcontroller</li>
+        </ul>
+    </div>
+
+    <div class="container" id="technical">
+        <h2>📊 Technical Specifications</h2>
+        
+        <h3>Microcontroller Specifications</h3>
+        <table class="pin-table">
+            <tr>
+                <th>Parameter</th>
+                <th>Value</th>
+                <th>Notes</th>
+            </tr>
+            <tr>
+                <td>Microcontroller</td>
+                <td>ESP32-S3</td>
+                <td>Dual-core Xtensa LX7, 240 MHz</td>
+            </tr>
+            <tr>
+                <td>Flash Memory</td>
+                <td>8 MB</td>
+                <td>For firmware and data storage</td>
+            </tr>
+            <tr>
+                <td>RAM</td>
+                <td>512 KB SRAM</td>
+                <td>System and application memory</td>
+            </tr>
+            <tr>
+                <td>Bluetooth</td>
+                <td>Bluetooth LE 5.0</td>
+                <td>Low energy for extended operation</td>
+            </tr>
+            <tr>
+                <td>Operating Voltage</td>
+                <td>3.3V</td>
+                <td>Regulated from 5V USB or external supply</td>
+            </tr>
+        </table>
+
+        <h3>Communication Specifications</h3>
+        <ul>
+            <li><strong>OBD-II Protocol:</strong> ISO 15765-4 (CAN), ISO 14230-4 (KWP2000)</li>
+            <li><strong>Bluetooth Range:</strong> ~10 meters (Class 2)</li>
+            <li><strong>Data Update Rate:</strong> 5-10 Hz (adaptive based on ECU response)</li>
+            <li><strong>Response Timeout:</strong> 1000ms with exponential backoff</li>
+        </ul>
+
+        <h3>Relay Specifications</h3>
+        <ul>
+            <li><strong>Contact Rating:</strong> 10A @ 250VAC, 10A @ 30VDC</li>
+            <li><strong>Coil Voltage:</strong> 3.3V (driven directly from GPIO)</li>
+            <li><strong>Switching Time:</strong> ~10ms typical</li>
+            <li><strong>Contact Configuration:</strong> SPDT (Single Pole, Double Throw)</li>
+        </ul>
+
+        <h3>Software Architecture</h3>
+        <ul>
+            <li><strong>RTOS:</strong> FreeRTOS with multiple tasks</li>
+            <li><strong>Task Structure:</strong>
+                <ul>
+                    <li>Bluetooth communication task</li>
+                    <li>OBD data polling task</li>
+                    <li>GPIO control task</li>
+                    <li>LED indicator task</li>
+                </ul>
+            </li>
+            <li><strong>Memory Management:</strong> Static allocation with overflow protection</li>
+            <li><strong>Error Handling:</strong> Comprehensive error recovery and logging</li>
+        </ul>
+    </div>
+
+    <div class="container">
+        <h2>📞 Support & Contact</h2>
+        <p>For technical support, bug reports, or feature requests, please check the project documentation or contact the development team.</p>
+        
+        <h3>Version Information</h3>
+        <ul>
+            <li><strong>Firmware Version:</strong> 1.0.0</li>
+            <li><strong>Platform:</strong> ESP-IDF with PlatformIO</li>
+            <li><strong>Last Updated:</strong> December 2024</li>
+        </ul>
+        
+        <div class="success">
+            <strong>🎉 Project Status:</strong> This project is actively maintained and ready for production use with proper safety precautions.
+        </div>
+    </div>
+
+    <footer style="text-align: center; padding: 2rem; color: #666; border-top: 1px solid #eee; margin-top: 2rem;">
+        <p>&copy; 2024 ESP32 OBD-II NOS Controller Project. Built with ESP-IDF and PlatformIO.</p>
+    </footer>
+</body>
+</html> 
