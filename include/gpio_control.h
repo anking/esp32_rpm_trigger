@@ -22,9 +22,15 @@
 #define NOS_READY_RELAY     RELAY_1_PIN  // NOS readiness relay (10A capability!)
 #define NOS_AUTO_INJ_RELAY  RELAY_2_PIN  // NOS auto injection relay (10A capability!)
 
+// LED indicator relay assignments
+#define BT_STATUS_LED_RELAY    RELAY_3_PIN  // Bluetooth status LED relay
+#define ECU_STATUS_LED_RELAY   RELAY_4_PIN  // ECU status LED relay  
+#define NOS_STATUS_LED_RELAY   RELAY_5_PIN  // NOS readiness LED relay
+
 // Function declarations
 void gpio_init_system(void);
 void bluetooth_led_task(void *pv);
+void led_indicator_task(void *pv);
 
 // Status update functions (for internal use by automatic LED control)
 void set_ecu_status(bool connected);

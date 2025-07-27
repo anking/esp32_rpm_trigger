@@ -339,6 +339,7 @@ void verify_ecu_connection(void) {
         
         if (test_ecu_connectivity()) {
             ecu_connected = true;
+            set_ecu_status(true);  // Notify GPIO module that ECU is connected
             LOG_INFO(TAG, "✅ === ECU CONNECTION ESTABLISHED ===");
             LOG_INFO(TAG, "🚗 Vehicle ECU is responding to OBD commands");
             LOG_INFO(TAG, "🎯 System ready for OBD data polling!");
@@ -476,7 +477,7 @@ void initialize_elm327(void) {
     
     elm327_initialized = true;
     elm_ready = true;
-    set_ecu_status(true);
+    // Note: ECU status will be set by verify_ecu_connection() when actually connected
     LOG_INFO(TAG, "ELM327 initialization complete - diagnostics above show readiness!");
     
     if (connection_semaphore != NULL) {
@@ -645,7 +646,7 @@ void initialize_elm327_task(void *pv) {
     // Mark as initialized
     elm327_initialized = true;
     elm_ready = true;
-    set_ecu_status(true);
+    // Note: ECU status will be set by verify_ecu_connection() when actually connected
     initialization_in_progress = false;
     LOG_INFO(TAG, "✅ === ELM327 INITIALIZATION COMPLETE ===");
     

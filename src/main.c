@@ -108,6 +108,11 @@ void app_main(void) {
     xTaskCreate(bluetooth_led_task, "bt_led", 2048, NULL, 4, NULL);
     LOG_INFO(TAG, "Bluetooth LED task created");
     
+    // Create relay-based LED indicator task
+    LOG_INFO(TAG, "Creating LED indicator task...");
+    xTaskCreate(led_indicator_task, "led_indicators", 2048, NULL, 3, NULL);
+    LOG_INFO(TAG, "LED indicator task created");
+    
     // Log target ELM327 device
     LOG_INFO(TAG, "Looking for ELM327 device: [01:23:45:67:89:BA]");
     

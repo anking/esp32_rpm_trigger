@@ -358,6 +358,71 @@ void bluetooth_led_task(void *pv) {
             vTaskDelay(pdMS_TO_TICKS(500));   // Check every 500ms
         }
     }
+}
+
+// LED Indicator task - handles relay-based LED indicators for system status
+void led_indicator_task(void *pv) {
+    LOG_VERBOSE(TAG, "LED indicator task started");
+    
+    uint32_t cycle_counter = 0;
+    
+    while (1) {
+        cycle_counter++;
+        
+        // Skip LED control during burst mode
+        if (led_burst_active) {
+            // Turn off all indicator LEDs during burst
+            gpio_set_level(BT_STATUS_LED_RELAY, 0);
+            gpio_set_level(ECU_STATUS_LED_RELAY, 0);
+            gpio_set_level(NOS_STATUS_LED_RELAY, 0);
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+        
+        // === BLUETOOTH STATUS LED (RELAY 3) ===
+        if (is_connected) {
+            // BT connected - solid ON
+            gpio_set_level(BT_STATUS_LED_RELAY, 1);
+        } else if (is_scanning || is_connecting) {
+            // BT connecting - blink every 500ms (1Hz)
+            bool blink_state = (cycle_counter % 10) < 5;  // 50ms * 10 = 500ms cycle
+            gpio_set_level(BT_STATUS_LED_RELAY, blink_state ? 1 : 0);
+        } else {
+            // BT off - LED off
+            gpio_set_level(BT_STATUS_LED_RELAY, 0);
+        }
+        
+        // === ECU STATUS LED (RELAY 4) ===
+        if (is_connected && ecu_connected) {
+            // ECU connected - solid ON
+            gpio_set_level(ECU_STATUS_LED_RELAY, 1);
+        } else if (is_connected && !ecu_connected) {
+            // ECU connecting - blink every 500ms (1Hz)
+            bool blink_state = (cycle_counter % 10) < 5;  // 50ms * 10 = 500ms cycle
+            gpio_set_level(ECU_STATUS_LED_RELAY, blink_state ? 1 : 0);
+        } else {
+            // ECU off - LED off
+            gpio_set_level(ECU_STATUS_LED_RELAY, 0);
+        }
+        
+        // === NOS STATUS LED (RELAY 5) ===
+        if (is_connected && ecu_connected && nos_conditions_met) {
+            if (auto_injection_mode) {
+                // Auto injection mode - slow blink every 2 seconds (0.5Hz)
+                bool slow_blink_state = (cycle_counter % 40) < 20;  // 50ms * 40 = 2s cycle
+                gpio_set_level(NOS_STATUS_LED_RELAY, slow_blink_state ? 1 : 0);
+            } else {
+                // Manual mode - solid ON when ready
+                gpio_set_level(NOS_STATUS_LED_RELAY, 1);
+            }
+        } else {
+            // NOS not ready - LED off
+            gpio_set_level(NOS_STATUS_LED_RELAY, 0);
+        }
+        
+        // Run every 50ms for smooth blinking
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
 } 
 
 // RGB LED control function
