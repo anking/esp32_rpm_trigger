@@ -406,17 +406,18 @@ void led_indicator_task(void *pv) {
         }
         
         // === NOS STATUS LED (RELAY 5) ===
-        if (is_connected && ecu_connected && nos_conditions_met) {
+        // Once OBD data collection begins (ECU connected), show mode status
+        if (is_connected && ecu_connected) {
             if (auto_injection_mode) {
                 // Auto injection mode - slow blink every 2 seconds (0.5Hz)
                 bool slow_blink_state = (cycle_counter % 40) < 20;  // 50ms * 40 = 2s cycle
                 gpio_set_level(NOS_STATUS_LED_RELAY, slow_blink_state ? 1 : 0);
             } else {
-                // Manual mode - solid ON when ready
+                // Manual mode - solid ON
                 gpio_set_level(NOS_STATUS_LED_RELAY, 1);
             }
         } else {
-            // NOS not ready - LED off
+            // System initializing or disconnected - LED off
             gpio_set_level(NOS_STATUS_LED_RELAY, 0);
         }
         

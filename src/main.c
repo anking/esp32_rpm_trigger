@@ -13,6 +13,7 @@
 #include "obd_data.h"
 #include "gpio_control.h"
 #include "bt_test_stub.h"
+#include "webserver.h"
 
 // Enable this define to build a minimal firmware that only scans for the
 // VEEPEAK adapter (no OBD, relays, etc.)
@@ -103,7 +104,22 @@ void app_main(void) {
     bluetooth_init();
     LOG_INFO(TAG, "Bluetooth initialized");
     
-    // Create Bluetooth LED indicator task (after bluetooth init)
+    // Initialize Web Server system (EARLY FOR DEBUGGING)
+    ESP_LOGI(TAG, "🌐 ================================");
+    ESP_LOGI(TAG, "🌐 STARTING WEB SERVER INITIALIZATION");
+    ESP_LOGI(TAG, "🌐 ================================");
+    esp_err_t web_ret = webserver_init();
+    if (web_ret == ESP_OK) {
+        ESP_LOGI(TAG, "🌐 ✅ WEB SERVER INITIALIZED SUCCESSFULLY!");
+        ESP_LOGI(TAG, "🌐 📱 Connect to WiFi: ESP32-NOS-Controller");
+        ESP_LOGI(TAG, "🌐 🔑 Password: nos123456");
+        ESP_LOGI(TAG, "🌐 🌍 URL: http://192.168.4.1");
+    } else {
+        ESP_LOGE(TAG, "🌐 ❌ WEB SERVER FAILED: %s", esp_err_to_name(web_ret));
+    }
+    ESP_LOGI(TAG, "🌐 ================================");
+    
+    // Create Bluetooth LED task
     LOG_INFO(TAG, "Creating Bluetooth LED task...");
     xTaskCreate(bluetooth_led_task, "bt_led", 2048, NULL, 4, NULL);
     LOG_INFO(TAG, "Bluetooth LED task created");
@@ -122,7 +138,7 @@ void app_main(void) {
     start_ble_scan();
     LOG_INFO(TAG, "Device search started");
     
-    // Create OBD data polling task
+    // Start OBD data collection task
     LOG_INFO(TAG, "Creating OBD task...");
     xTaskCreate(obd_task, "obd_task", 4096, NULL, 5, NULL);
     LOG_INFO(TAG, "OBD task created");
