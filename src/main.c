@@ -12,7 +12,6 @@
 #include "elm327.h"
 #include "obd_data.h"
 #include "gpio_control.h"
-#include "bt_test_stub.h"
 #include "webserver.h"
 
 // Enable this define to build a minimal firmware that only scans for the

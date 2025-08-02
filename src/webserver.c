@@ -39,7 +39,7 @@ static const char index_html[] =
 "</head>"
 "<body>"
 "    <div class='container'>"
-"        <h1>🚗 ESP32 NOS Controller</h1>"
+"        <h1>🚗 NOS Controller</h1>"
 "        <div class='status-box'>"
 "            <h3>Current Mode</h3>"
 "            <p id='current-mode'></p>"
